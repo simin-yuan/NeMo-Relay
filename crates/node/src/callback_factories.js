@@ -238,15 +238,6 @@
       }
       return failure;
     };
-    controller.signal.addEventListener(
-      'abort',
-      () => {
-        for (const downstream of downstreams.keys()) {
-          closeDownstream(downstream).catch(() => {});
-        }
-      },
-      { once: true },
-    );
     let ownsPublicationState = false;
     let publicationState;
     if (publicationContextId !== undefined) {
@@ -276,6 +267,18 @@
       expireCallbackStore(token);
       controllers.delete(callId);
     };
+    controller.signal.addEventListener(
+      'abort',
+      () => {
+        for (const downstream of downstreams.keys()) {
+          closeDownstream(downstream).catch(() => {});
+        }
+        if (!streamResult) {
+          settlePublication();
+        }
+      },
+      { once: true },
+    );
     const invokeNext = (value) =>
       settle.next(next, jsonValue(value === undefined ? null : value), eventSanitizerContext.getStore()?.scope);
     const safeNext =
@@ -504,7 +507,8 @@
     promise(fn, resolve, reject, streamPush, streamEnd, next) {
       const settle = { resolve, reject, streamPush, streamEnd, next };
       const controllers = new Map();
-      return function __nemo_relay_promise_wrapper(
+      const cancelled = new Set();
+      const wrapper = function __nemo_relay_promise_wrapper(
         error,
         abort,
         callId,
@@ -521,7 +525,16 @@
           return;
         }
         if (abort) {
-          controllers.get(callId)?.abort();
+          const controller = controllers.get(callId);
+          if (controller === undefined) {
+            cancelled.add(callId);
+            return;
+          }
+          controller.abort();
+          return;
+        }
+        const alreadyCancelled = cancelled.delete(callId);
+        if (alreadyCancelled && !streamResult) {
           return;
         }
         callPromise(
@@ -537,7 +550,12 @@
           scope,
           streamResult,
         );
+        if (alreadyCancelled) {
+          controllers.get(callId)?.abort();
+        }
       };
+      wrapper.pendingCalls = () => controllers.size;
+      return wrapper;
     },
 
     scoped(fn) {

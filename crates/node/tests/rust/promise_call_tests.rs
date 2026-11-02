@@ -21,3 +21,66 @@ fn execution_next_context_restores_scope() {
         assert!(Arc::ptr_eq(&observed, &scope_stack));
     });
 }
+
+fn json_completion() -> (
+    CallCompletion,
+    tokio::sync::oneshot::Receiver<FlowResult<Json>>,
+) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    (
+        CallCompletion::Json(JsonCompletion {
+            sender,
+            finished: Arc::new(AtomicBool::new(false)),
+        }),
+        receiver,
+    )
+}
+
+fn assert_sender_dropped(mut receiver: tokio::sync::oneshot::Receiver<FlowResult<Json>>) {
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+}
+
+#[test]
+fn cancel_drops_a_json_call_that_never_settles() {
+    let registry = CallRegistry::default();
+    let call_id = registry.allocate();
+    let (completion, receiver) = json_completion();
+    assert!(registry.insert(call_id, completion));
+    registry.cancel(call_id);
+    registry.resolve(call_id, || Ok(Json::Null));
+    assert!(registry.stream(call_id).is_none());
+    assert_sender_dropped(receiver);
+}
+
+#[test]
+fn cancel_before_insert_drops_a_json_call() {
+    let registry = CallRegistry::default();
+    let call_id = registry.allocate();
+    registry.cancel(call_id);
+    let (completion, receiver) = json_completion();
+    assert!(!registry.insert(call_id, completion));
+    assert_sender_dropped(receiver);
+}
+
+#[test]
+fn cancel_keeps_a_stream_call() {
+    let registry = CallRegistry::default();
+    let call_id = registry.allocate();
+    let (ready_sender, _ready_receiver) = tokio::sync::oneshot::channel();
+    let (chunk_sender, _chunk_receiver) = tokio::sync::mpsc::channel(1);
+    let (closed, _closed_rx) = tokio::sync::watch::channel(None);
+    let completion = CallCompletion::Stream(Arc::new(StreamCompletion {
+        ready: Mutex::new(Some(ready_sender)),
+        chunks: Mutex::new(Some(chunk_sender)),
+        terminal_error: Mutex::new(None),
+        closed,
+        finished: Arc::default(),
+        parked: Mutex::new(None),
+    }));
+    assert!(registry.insert(call_id, completion));
+    registry.cancel(call_id);
+    assert!(registry.stream(call_id).is_some());
+}

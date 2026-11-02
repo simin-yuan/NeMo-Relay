@@ -5,6 +5,7 @@
 //! and the teardown flag.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -43,7 +44,6 @@ pub(crate) enum Liveness {
 }
 
 pub(crate) struct EnvState {
-    env: napi::sys::napi_env,
     teardown: Arc<AtomicBool>,
     pub(crate) factories: Factories,
     settler: Arc<Tsfn<Settlement, ()>>,
@@ -51,23 +51,23 @@ pub(crate) struct EnvState {
 }
 
 thread_local! {
-    static STATE: RefCell<Option<Rc<EnvState>>> = const { RefCell::new(None) };
+    static STATES: RefCell<HashMap<usize, Rc<EnvState>>> = RefCell::new(HashMap::new());
+}
+
+fn env_key(env: &Env) -> usize {
+    env.raw() as usize
 }
 
 pub(crate) fn state(env: &Env) -> napi::Result<Rc<EnvState>> {
-    if let Some(state) = STATE.with(|slot| slot.borrow().clone()) {
-        debug_assert_eq!(
-            state.env,
-            env.raw(),
-            "environment state used by another environment"
-        );
+    let key = env_key(env);
+    if let Some(state) = STATES.with(|slot| slot.borrow().get(&key).cloned()) {
         return Ok(state);
     }
     let state = Rc::new(EnvState::new(env)?);
     // Runs before Node closes the settler. The hook is registered after the threadsafe
     // function, and Node runs cleanup hooks last-in first-out.
-    env.add_env_cleanup_hook((), |()| {
-        if let Some(state) = STATE.with(|slot| slot.borrow_mut().take()) {
+    env.add_env_cleanup_hook(key, |key| {
+        if let Some(state) = STATES.with(|slot| slot.borrow_mut().remove(&key)) {
             state.teardown.store(true, Ordering::Release);
             if let Err(error) = abort_tsfn(&state.settler) {
                 record_callback_error(format!(
@@ -76,7 +76,9 @@ pub(crate) fn state(env: &Env) -> napi::Result<Rc<EnvState>> {
             }
         }
     })?;
-    STATE.with(|slot| slot.replace(Some(Rc::clone(&state))));
+    STATES.with(|slot| {
+        slot.borrow_mut().insert(key, Rc::clone(&state));
+    });
     Ok(state)
 }
 
@@ -94,7 +96,6 @@ impl EnvState {
             .weak::<true>()
             .build_callback(|ctx: ThreadsafeCallContext<Settlement>| ctx.value.deliver(&ctx.env))?;
         Ok(Self {
-            env: env.raw(),
             teardown: Arc::new(AtomicBool::new(false)),
             factories,
             settler: Arc::new(settler),

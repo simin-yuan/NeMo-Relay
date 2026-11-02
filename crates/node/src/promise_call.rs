@@ -6,8 +6,8 @@
 //! This module wraps JS middleware callbacks so Rust can call them from any thread
 //! and await either synchronous return values or Promise-returning callbacks.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -235,9 +235,15 @@ impl CallCompletion {
 }
 
 #[derive(Default)]
+struct CallRegistryState {
+    calls: HashMap<u64, CallCompletion>,
+    cancelled: HashSet<u64>,
+}
+
+#[derive(Default)]
 struct CallRegistry {
     next_id: AtomicU64,
-    calls: Mutex<HashMap<u64, CallCompletion>>,
+    state: Mutex<CallRegistryState>,
 }
 
 impl CallRegistry {
@@ -245,39 +251,58 @@ impl CallRegistry {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn insert(&self, call_id: u64, completion: CallCompletion) {
-        self.calls.lock().unwrap().insert(call_id, completion);
+    fn insert(&self, call_id: u64, completion: CallCompletion) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let cancelled = state.cancelled.remove(&call_id);
+        if cancelled && matches!(completion, CallCompletion::Json(_)) {
+            return false;
+        }
+        state.calls.insert(call_id, completion);
+        true
     }
 
     fn resolve(&self, call_id: u64, value: impl FnOnce() -> FlowResult<Json>) {
-        let mut calls = self.calls.lock().unwrap();
-        if let Some(completion) = calls.remove(&call_id)
+        let mut state = self.state.lock().unwrap();
+        if let Some(completion) = state.calls.remove(&call_id)
             && let Some(kept) = completion.resolve(value)
         {
-            calls.insert(call_id, kept);
+            state.calls.insert(call_id, kept);
         }
     }
 
     fn fail(&self, call_id: u64, error: FlowError) {
-        if let Some(completion) = self.calls.lock().unwrap().remove(&call_id) {
+        if let Some(completion) = self.state.lock().unwrap().calls.remove(&call_id) {
             completion.fail(error);
         }
     }
 
     fn stream(&self, call_id: u64) -> Option<Arc<StreamCompletion>> {
-        match self.calls.lock().unwrap().get(&call_id) {
+        match self.state.lock().unwrap().calls.get(&call_id) {
             Some(CallCompletion::Stream(stream)) => Some(Arc::clone(stream)),
             Some(CallCompletion::Json(_)) | None => None,
         }
     }
 
     fn end_stream(&self, call_id: u64) {
-        let mut calls = self.calls.lock().unwrap();
-        if let Entry::Occupied(entry) = calls.entry(call_id)
+        let mut state = self.state.lock().unwrap();
+        if let Entry::Occupied(entry) = state.calls.entry(call_id)
             && let CallCompletion::Stream(stream) = entry.get()
         {
             stream.finish(Ok(()));
             entry.remove();
+        }
+    }
+
+    fn cancel(&self, call_id: u64) {
+        let mut state = self.state.lock().unwrap();
+        match state.calls.entry(call_id) {
+            Entry::Occupied(entry) if matches!(entry.get(), CallCompletion::Json(_)) => {
+                entry.remove();
+            }
+            Entry::Occupied(_) => {}
+            Entry::Vacant(_) => {
+                state.cancelled.insert(call_id);
+            }
         }
     }
 }
@@ -591,24 +616,33 @@ fn build_promise_args(
     let env = &ctx.env;
     let undefined = js_value(env, ())?;
     match ctx.value {
-        PromiseCall::Abort(call_id) => Ok(FnArgs::from((
-            js_value(env, true)?,
-            js_value(env, call_id as f64)?,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-        ))),
+        PromiseCall::Abort(call_id) => {
+            calls.cancel(call_id);
+            Ok(FnArgs::from((
+                js_value(env, true)?,
+                js_value(env, call_id as f64)?,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+            )))
+        }
         PromiseCall::Invoke(call) => {
             let CallArgs { invoke, completion } = *call;
             let call_id = invoke.call_id;
             match build_invoke_args(env, invoke, undefined) {
                 Ok(args) => {
-                    calls.insert(call_id, completion);
-                    Ok(args)
+                    if calls.insert(call_id, completion) {
+                        Ok(args)
+                    } else {
+                        Err(napi::Error::new(
+                            napi::Status::Cancelled,
+                            "JavaScript callback was cancelled before it started",
+                        ))
+                    }
                 }
                 Err(error) => {
                     completion.fail(FlowError::Internal(format!(

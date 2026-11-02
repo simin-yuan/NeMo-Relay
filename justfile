@@ -1024,6 +1024,48 @@ is_true() {
             ;;
     esac
 }
+
+install_locked_napi_cross_toolchain() {
+    local target="$1"
+    local host_arch=""
+    local package=""
+    local archive=""
+    local version=""
+    local cache=""
+    local stage=""
+    host_arch="$(node -p 'process.arch')"
+    case "${host_arch}:${target}" in
+        x64:x86_64-unknown-linux-gnu)
+            package='@napi-rs/cross-toolchain-x64-target-x86_64'
+            ;;
+        arm64:aarch64-unknown-linux-gnu)
+            package='@napi-rs/cross-toolchain-arm64-target-aarch64'
+            ;;
+        *)
+            echo "Error: --use-napi-cross on ${host_arch} for ${target} has no locked toolchain package" >&2
+            exit 1
+            ;;
+    esac
+    if ! node -e "require.resolve('${package}/package.json')" >/dev/null 2>&1; then
+        echo "Error: ${package} is not installed. It must be an exact optional dependency so --use-napi-cross does not download an unlocked toolchain." >&2
+        exit 1
+    fi
+    version="$(node -p "require('@napi-rs/cross-toolchain/package.json').version")"
+    cache="${HOME}/.napi-rs/cross-toolchain/${version}/${target}"
+    if [[ -f "${cache}/package.json" ]]; then
+        return 0
+    fi
+    archive="$(node -p "require('${package}').toolchainPath")"
+    stage="$(mktemp -d)"
+    tar -xJf "$archive" -C "$stage"
+    if [[ ! -f "${stage}/package.json" ]]; then
+        echo "Error: ${package} did not contain a toolchain package.json" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "$cache")"
+    rm -rf "$cache"
+    mv "$stage" "$cache"
+}
 '''
 
 # validate quickstart metadata, referenced files, and checker tests (no guide execution)
@@ -1993,6 +2035,9 @@ package-node:
             ;;
     esac
     npm install --workspace=nemo-relay-node --ignore-scripts
+    if [[ "$node_build_strategy" == napi-cross ]]; then
+        install_locked_napi_cross_toolchain "$node_target"
+    fi
     npm run --workspace=nemo-relay-node "${build_args[@]}"
     if [[ -z "$node_platform" ]]; then
         case "$(uname -s)-$(uname -m)" in
