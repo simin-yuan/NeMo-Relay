@@ -74,6 +74,7 @@ fn chained(error: &dyn std::error::Error) -> napi::Error {
 
 pub(crate) fn throw(env: &Env, error: napi::Error) -> napi::Error {
     let mut pending = false;
+    // SAFETY: `env` is the live environment of the calling JavaScript thread.
     if let Err(failure) =
         check_status!(unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) })
     {

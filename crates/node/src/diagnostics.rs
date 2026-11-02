@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Embedded diagnostics readers. No language object retains a core query lease.
 use napi::bindgen_prelude::{BigInt, JsObjectValue, JsValue, Object, Unknown};
 use napi::{Env, JsString};
 use napi_derive::napi;
@@ -18,7 +17,7 @@ fn bounded_query(query: Option<JsString>) -> Result<String> {
     if query.utf8_len()? > embedded::MAX_BINDING_QUERY_BYTES {
         return Err(Error::invalid_argument("invalid_query"));
     }
-    Ok(query.into_utf8()?.as_str()?.to_owned())
+    Ok(query.into_utf8()?.into_owned()?)
 }
 fn camel_case(key: &str) -> String {
     let mut result = String::with_capacity(key.len());

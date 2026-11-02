@@ -1,12 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conversion utilities for bridging between NeMo Relay core types and NAPI types.
-//!
-//! Provides helpers to convert errors and optional JSON values between the core
-//! runtime representation and the NAPI binding layer.
-
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
 
 use chrono::{DateTime, Utc};
 use napi::bindgen_prelude::{
@@ -19,11 +17,8 @@ use serde_json::Value as Json;
 
 use crate::error::{Error, Result};
 
-/// JavaScript value passed to or returned from a `Function` call without a scope lifetime.
-///
-/// Closure and threadsafe callback signatures are fixed at creation. A value built later
-/// on the JavaScript thread travels as this carrier. A carrier is valid only inside the
-/// JavaScript call or callback that created it.
+pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
 #[derive(Clone, Copy)]
 pub(crate) struct JsArg {
     env: napi::sys::napi_env,
@@ -79,8 +74,8 @@ impl FromNapiValue for Callback<'_> {
         env: napi::sys::napi_env,
         value: napi::sys::napi_value,
     ) -> napi::Result<Self> {
-        let unknown = unsafe { Unknown::from_raw_unchecked(env, value) };
-        match unknown.get_type()? {
+        match napi::type_of!(env, value)? {
+            // SAFETY: the value was just typed as a function in `env`.
             ValueType::Function => Ok(Self(unsafe { Function::from_napi_value(env, value) }?)),
             other => Err(napi::Error::new(
                 Status::InvalidArg,
@@ -93,11 +88,9 @@ impl FromNapiValue for Callback<'_> {
 pub(crate) type JsArgs2 = FnArgs<(JsArg, JsArg)>;
 pub(crate) type JsArgs3 = FnArgs<(JsArg, JsArg, JsArg)>;
 
-/// Weak threadsafe function. JavaScript receives the call arguments only.
 pub(crate) type Tsfn<T, Args = T, Return = ()> =
     ThreadsafeFunction<T, Return, Args, Status, false, true>;
 
-/// Weak threadsafe function. JavaScript receives an error or null before the call arguments.
 pub(crate) type HandledTsfn<T, Args = T, Return = ()> =
     ThreadsafeFunction<T, Return, Args, Status, true, true>;
 
@@ -109,33 +102,40 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// JavaScript function kept alive for later direct calls on the creating thread.
 pub(crate) struct PersistentJsFunction<Args: JsValuesTupleIntoVec, Return> {
     env: Env,
+    thread: ThreadId,
     reference: FunctionRef<Args, Return>,
 }
 
-// SAFETY: `env` is read on the creating thread only. Callers check the current thread
-// before borrowing the function back. `FunctionRef` is `Send` and `Sync` and routes a
-// release from another thread back to the JavaScript thread.
+// SAFETY: `env` is dereferenced only by `borrow`, which refuses every thread but the
+// creating one. `FunctionRef` is `Send` and `Sync` and routes a release from another
+// thread back to the JavaScript thread.
 unsafe impl<Args: JsValuesTupleIntoVec, Return> Send for PersistentJsFunction<Args, Return> {}
-// SAFETY: as for `Send`. Both fields are immutable after construction.
+// SAFETY: as for `Send`. All fields are immutable after construction.
 unsafe impl<Args: JsValuesTupleIntoVec, Return> Sync for PersistentJsFunction<Args, Return> {}
 
 impl<Args: JsValuesTupleIntoVec, Return> PersistentJsFunction<Args, Return> {
     pub(crate) fn new(env: &Env, function: &Function<'_, Args, Return>) -> napi::Result<Self> {
         Ok(Self {
             env: *env,
+            thread: std::thread::current().id(),
             reference: function.create_ref()?,
         })
     }
 
-    pub(crate) fn env(&self) -> Env {
-        self.env
+    pub(crate) fn on_creating_thread(&self) -> bool {
+        std::thread::current().id() == self.thread
     }
 
-    pub(crate) fn function(&self) -> napi::Result<Function<'_, Args, Return>> {
-        self.reference.borrow_back(&self.env)
+    pub(crate) fn borrow(&self) -> napi::Result<(&Env, Function<'_, Args, Return>)> {
+        if !self.on_creating_thread() {
+            return Err(napi::Error::new(
+                Status::GenericFailure,
+                "JavaScript function borrowed outside its creating thread",
+            ));
+        }
+        Ok((&self.env, self.reference.borrow_back(&self.env)?))
     }
 }
 
@@ -201,33 +201,24 @@ pub(crate) fn report_queue_status(status: Status, call: &str) {
 
 static LAST_CALLBACK_ERROR: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
-/// Record the most recent callback error observed inside the Node binding.
-pub fn record_callback_error(message: impl Into<String>) {
+pub(crate) fn record_callback_error(message: impl Into<String>) {
     let message = message.into();
     eprintln!("{message}");
     *lock(&LAST_CALLBACK_ERROR) = Some(message);
 }
 
-/// Read the most recent callback error observed inside the Node binding.
-pub fn get_last_callback_error() -> Option<String> {
+pub(crate) fn get_last_callback_error() -> Option<String> {
     lock(&LAST_CALLBACK_ERROR).clone()
 }
 
-/// Clear the most recent callback error observed inside the Node binding.
-pub fn clear_last_callback_error() {
+pub(crate) fn clear_last_callback_error() {
     *lock(&LAST_CALLBACK_ERROR) = None;
 }
 
-/// Filter an optional JSON value, converting explicit `null` values to `None`.
-///
-/// NAPI's serde-json feature handles most conversion automatically, but JavaScript
-/// may pass `null` where Rust expects `None`. This normalizes that case.
-pub fn opt_json(val: Option<Json>) -> Option<Json> {
+pub(crate) fn opt_json(val: Option<Json>) -> Option<Json> {
     val.filter(|v| !v.is_null())
 }
 
-/// Convert JSON input. Throw a TypeError for a BigInt instead of coercing it.
-/// Read properties once so getters cannot bypass the BigInt check.
 pub(crate) fn checked_json(env: &Env, value: Unknown) -> Result<Json> {
     checked_json_within(env, value, MAX_JSON_DEPTH)
 }
@@ -274,8 +265,7 @@ fn checked_json_within(env: &Env, value: Unknown, remaining_depth: u32) -> Resul
     }
 }
 
-/// Parse optional Unix microseconds since epoch into a UTC timestamp.
-pub fn parse_timestamp_micros(value: Option<f64>) -> Result<Option<DateTime<Utc>>> {
+pub(crate) fn parse_timestamp_micros(value: Option<f64>) -> Result<Option<DateTime<Utc>>> {
     value
         .map(|timestamp| {
             if !timestamp.is_finite()

@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Promise-aware JS function calling for NeMo Relay NAPI bindings.
-//!
-//! This module wraps JS middleware callbacks so Rust can call them from any thread
-//! and await either synchronous return values or Promise-returning callbacks.
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -15,7 +10,7 @@ use std::task::{Context, Poll};
 
 use napi::Env;
 use napi::bindgen_prelude::{
-    External, FnArgs, FromNapiRef, Function, FunctionCallContext, JsValue, Unknown,
+    External, FnArgs, FromNapiRef, Function, FunctionCallContext, JsValue, PromiseRaw, Unknown,
     within_runtime_if_available,
 };
 use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMode};
@@ -24,12 +19,15 @@ use serde_json::Value as Json;
 use nemo_relay_runtime::api::runtime::subscriber_dispatcher::{
     PublicationBuffer, with_nested_publication_buffer, with_task_nested_publication_buffer,
 };
-use nemo_relay_runtime::api::runtime::{LlmStreamInner, MiddlewareContinuationContext};
+use nemo_relay_runtime::api::runtime::{
+    LlmJsonStream, LlmStreamInner, MiddlewareContinuationContext,
+};
 use nemo_relay_types::error::{FlowError, Result as FlowResult};
 
-use crate::callback_factory::{self, CallbackScope, PromiseSettlers};
+use crate::callback_factory::{self, CallbackScope, Settlers};
 use crate::convert::{
-    HandledTsfn, JsArg, abort_tsfn, closure_function, detach, js_value, lock, report_queue_status,
+    BoxFuture, HandledTsfn, JsArg, abort_tsfn, closure_function, detach, js_value, lock,
+    report_queue_status,
 };
 use crate::environment::{Liveness, create_promise, spawn_promise};
 use crate::error::{Error, Result};
@@ -39,26 +37,26 @@ tokio::task_local! {
     static PUBLICATION_CALLBACK_CONTEXT_ID: Option<String>;
 }
 
-pub(crate) async fn with_publication_callback_context<F: Future>(
-    context_id: Option<String>,
-    publication_buffer: Option<PublicationBuffer>,
-    future: F,
-) -> F::Output {
-    with_task_nested_publication_buffer(
-        publication_buffer,
-        PUBLICATION_CALLBACK_CONTEXT_ID.scope(context_id, future),
-    )
-    .await
+#[derive(Clone, Default)]
+pub(crate) struct PublicationContext {
+    pub(crate) context_id: Option<String>,
+    pub(crate) publication_buffer: Option<PublicationBuffer>,
 }
 
-pub(crate) fn with_publication_callback_context_sync<T>(
-    context_id: Option<String>,
-    publication_buffer: Option<PublicationBuffer>,
-    f: impl FnOnce() -> T,
-) -> T {
-    with_nested_publication_buffer(publication_buffer, || {
-        PUBLICATION_CALLBACK_CONTEXT_ID.sync_scope(context_id, f)
-    })
+impl PublicationContext {
+    pub(crate) async fn run<F: Future>(self, future: F) -> F::Output {
+        with_task_nested_publication_buffer(
+            self.publication_buffer,
+            PUBLICATION_CALLBACK_CONTEXT_ID.scope(self.context_id, future),
+        )
+        .await
+    }
+
+    pub(crate) fn run_sync<T>(self, f: impl FnOnce() -> T) -> T {
+        with_nested_publication_buffer(self.publication_buffer, || {
+            PUBLICATION_CALLBACK_CONTEXT_ID.sync_scope(self.context_id, f)
+        })
+    }
 }
 
 pub(crate) fn publication_callback_context_id() -> Option<String> {
@@ -67,19 +65,9 @@ pub(crate) fn publication_callback_context_id() -> Option<String> {
         .unwrap_or(None)
 }
 
-pub type JsonNextFn =
-    Arc<dyn Fn(Json) -> Pin<Box<dyn Future<Output = FlowResult<Json>> + Send>> + Send + Sync>;
-pub type JsonStreamNextFn = Arc<
-    dyn Fn(
-            Json,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = FlowResult<nemo_relay_runtime::api::runtime::LlmJsonStream>>
-                    + Send,
-            >,
-        > + Send
-        + Sync,
->;
+pub(crate) type JsonNextFn = Arc<dyn Fn(Json) -> BoxFuture<FlowResult<Json>> + Send + Sync>;
+pub(crate) type JsonStreamNextFn =
+    Arc<dyn Fn(Json) -> BoxFuture<FlowResult<LlmJsonStream>> + Send + Sync>;
 
 #[derive(Clone)]
 enum NextFn {
@@ -93,20 +81,61 @@ struct NextState {
     publication_context_id: Option<String>,
 }
 
-/// Builds the first JS callback argument on the Node main thread.
-///
-/// Some callback arguments, such as `#[napi]` class instances, cannot cross the
-/// threadsafe-function boundary as plain JSON. This builder runs inside the
-/// threadsafe-function call (on the JS thread), so it can materialize those
-/// values directly instead of serializing them.
-pub type Arg0Builder = Box<dyn FnOnce(&Env) -> napi::Result<JsArg> + Send>;
+type Arg0Builder = Box<dyn FnOnce(&Env) -> napi::Result<JsArg> + Send>;
 
-/// The first argument passed to the wrapped JS callback.
 enum PrimaryArg {
-    /// A plain JSON value converted on the JS thread.
     Json(Json),
-    /// A value materialized on the JS thread by a builder closure.
     Build(Arg0Builder),
+}
+
+#[must_use]
+pub(crate) struct Invocation {
+    arg0: PrimaryArg,
+    spread: bool,
+    publication: bool,
+}
+
+impl Invocation {
+    pub(crate) fn single(arg: Json) -> Self {
+        Self {
+            arg0: PrimaryArg::Json(arg),
+            spread: false,
+            publication: false,
+        }
+    }
+
+    pub(crate) fn spread(args: Vec<Json>) -> Self {
+        Self {
+            arg0: PrimaryArg::Json(Json::Array(args)),
+            spread: true,
+            publication: false,
+        }
+    }
+
+    pub(crate) fn built(build: impl FnOnce(&Env) -> napi::Result<JsArg> + Send + 'static) -> Self {
+        Self {
+            arg0: PrimaryArg::Build(Box::new(build)),
+            spread: false,
+            publication: false,
+        }
+    }
+
+    pub(crate) fn spread_built(
+        build: impl FnOnce(&Env) -> napi::Result<JsArg> + Send + 'static,
+    ) -> Self {
+        Self {
+            arg0: PrimaryArg::Build(Box::new(build)),
+            spread: true,
+            publication: false,
+        }
+    }
+
+    pub(crate) fn publication(self, publication: bool) -> Self {
+        Self {
+            publication,
+            ..self
+        }
+    }
 }
 
 struct InvokeArgs {
@@ -130,7 +159,6 @@ enum PromiseCall {
     Abort(u64),
 }
 
-/// `(abort, callId, arg0, spread, next, publication, publicationContextId, scope, streamResult)`.
 type PromiseArgs = FnArgs<(
     JsArg,
     JsArg,
@@ -319,8 +347,6 @@ impl Drop for CallCancellationGuard {
     }
 }
 
-/// Provider aborts shared with the stream handle so `close()` can fire them while
-/// a collector blocks the forwarding task.
 #[derive(Clone, Default)]
 pub(crate) struct StreamCancellation {
     state: Arc<Mutex<StreamCancellationState>>,
@@ -397,7 +423,6 @@ impl LlmStreamInner for JsCallbackStream {
             if cleanup_ok {
                 return Ok(());
             }
-            // `None` means `poll_next` already delivered the error through `next()`.
             lock(&completion.terminal_error).take().map_or(Ok(()), Err)
         })
     }
@@ -427,7 +452,7 @@ fn call_id_argument(ctx: &FunctionCallContext) -> napi::Result<u64> {
     ctx.get::<f64>(0).map(|call_id| call_id as u64)
 }
 
-fn call_settlers(env: &Env, calls: &Arc<CallRegistry>) -> napi::Result<PromiseSettlers> {
+fn call_settlers(env: &Env, calls: &Arc<CallRegistry>) -> napi::Result<Settlers> {
     let resolve_calls = Arc::clone(calls);
     let resolve = closure_function(env, "__nemo_relay_resolve", move |ctx| {
         resolve_calls.resolve(call_id_argument(&ctx)?, || {
@@ -471,13 +496,13 @@ fn call_settlers(env: &Env, calls: &Arc<CallRegistry>) -> napi::Result<PromiseSe
         Ok(())
     })?;
     let next = closure_function(env, "__nemo_relay_next", continue_call)?;
-    Ok(FnArgs::from((
-        detach(env, &resolve),
-        detach(env, &reject),
-        detach(env, &stream_push),
-        detach(env, &stream_end),
-        detach(env, &next),
-    )))
+    Ok(Settlers {
+        resolve: detach(env, &resolve),
+        reject: detach(env, &reject),
+        stream_push: detach(env, &stream_push),
+        stream_end: detach(env, &stream_end),
+        next: detach(env, &next),
+    })
 }
 
 fn push_stream_chunk(env: &Env, calls: &CallRegistry, call_id: u64, chunk: Json) -> Result<JsArg> {
@@ -495,7 +520,7 @@ fn push_stream_chunk(env: &Env, calls: &CallRegistry, call_id: u64, chunk: Json)
             let task = within_runtime_if_available(|| {
                 tokio::spawn(async move {
                     let _ = chunks.send(chunk).await;
-                    pending.resolve_with(Box::new(|env| js_value(env, ())));
+                    pending.resolve_with(|env| js_value(env, ()));
                 })
             });
             *lock(&stream.parked) = Some(task);
@@ -518,42 +543,39 @@ fn continue_call(ctx: FunctionCallContext) -> Result<JsArg> {
         None => state.continuation_context.isolated(),
     }
     .map_err(Error::from)?;
-    let publication_context_id = state.publication_context_id.clone();
-    let promise = match &state.next {
+    let publication = PublicationContext {
+        context_id: state.publication_context_id.clone(),
+        publication_buffer: None,
+    };
+    let promise: PromiseRaw<'_, Json> = match &state.next {
         NextFn::Json(next) => {
             let next = next.clone();
-            spawn_promise::<Json, _, _, _, _>(
+            spawn_promise(
                 ctx.env,
-                async move {
-                    with_publication_callback_context(publication_context_id, None, async move {
-                        continuation
-                            .invoke(move || async move { next(arg).await.map_err(Error::from) })
-                            .await
-                    })
-                    .await
-                },
+                publication.run(async move {
+                    continuation
+                        .invoke(move || async move { next(arg).await.map_err(Error::from) })
+                        .await
+                }),
                 js_value,
             )
         }
         NextFn::Stream(next) => {
             let next = next.clone();
-            let stream_context_id = publication_context_id.clone();
-            spawn_promise::<Json, _, Error, _, _>(
+            let stream_publication = publication.clone();
+            spawn_promise(
                 ctx.env,
                 async move {
-                    let stream = with_publication_callback_context(
-                        publication_context_id,
-                        None,
-                        async move {
+                    let stream = publication
+                        .run(async move {
                             continuation
                                 .invoke(move || async move { next(arg).await.map_err(Error::from) })
                                 .await
-                        },
-                    )
-                    .await?;
-                    Ok(crate::api::llm_stream_from_rust_stream(
+                        })
+                        .await?;
+                    Ok::<_, Error>(crate::api::llm_stream_from_rust_stream(
                         stream,
-                        stream_context_id,
+                        stream_publication,
                     ))
                 },
                 js_value,
@@ -629,18 +651,13 @@ fn build_invoke_args(env: &Env, call: InvokeArgs, undefined: JsArg) -> napi::Res
     )))
 }
 
-/// A wrapper around a JS function that can be called from any thread and
-/// transparently handles both synchronous and Promise return values.
-pub struct PromiseAwareFn {
+pub(crate) struct PromiseAwareFn {
     tsfn: RwLock<Option<Arc<PromiseTsfn>>>,
     calls: Arc<CallRegistry>,
 }
 
 impl PromiseAwareFn {
-    /// Create a new `PromiseAwareFn` wrapping the given JS function.
-    ///
-    /// Must be called on the JS main thread (i.e., in a sync `#[napi]` function).
-    pub fn new(env: &Env, func: &Function<JsArg, JsArg>) -> napi::Result<Self> {
+    pub(crate) fn new(env: &Env, func: &Function<JsArg, JsArg>) -> napi::Result<Self> {
         let calls = Arc::new(CallRegistry::default());
         let settlers = call_settlers(env, &calls)?;
         let wrapper: Function<PromiseArgs, ()> =
@@ -659,78 +676,33 @@ impl PromiseAwareFn {
         })
     }
 
-    pub async fn call(&self, args: Json) -> FlowResult<Json> {
-        self.call_inner(PrimaryArg::Json(args), false, false, None)
-            .await
+    pub(crate) async fn call(&self, invocation: Invocation) -> FlowResult<Json> {
+        self.call_inner(invocation, None).await
     }
 
-    pub async fn call_spread(&self, args: Vec<Json>, publication: bool) -> FlowResult<Json> {
-        self.call_inner(PrimaryArg::Json(Json::Array(args)), true, publication, None)
-            .await
-    }
-
-    pub async fn call_with_arg0(&self, build_arg0: Arg0Builder) -> FlowResult<Json> {
-        self.call_inner(PrimaryArg::Build(build_arg0), false, false, None)
-            .await
-    }
-
-    pub async fn call_spread_with_arg0(
+    pub(crate) async fn call_with_next(
         &self,
-        build_arg0: Arg0Builder,
-        publication: bool,
-    ) -> FlowResult<Json> {
-        self.call_inner(PrimaryArg::Build(build_arg0), true, publication, None)
-            .await
-    }
-
-    pub async fn call_with_json_next(&self, args: Json, next: JsonNextFn) -> FlowResult<Json> {
-        self.call_inner(
-            PrimaryArg::Json(args),
-            false,
-            false,
-            Some(NextFn::Json(next)),
-        )
-        .await
-    }
-
-    pub async fn call_spread_with_arg0_and_json_next(
-        &self,
-        build_arg0: Arg0Builder,
+        invocation: Invocation,
         next: JsonNextFn,
     ) -> FlowResult<Json> {
-        self.call_inner(
-            PrimaryArg::Build(build_arg0),
-            true,
-            false,
-            Some(NextFn::Json(next)),
-        )
-        .await
+        self.call_inner(invocation, Some(NextFn::Json(next))).await
     }
 
-    /// Call a spread JavaScript callback with builder-constructed arguments
-    /// followed by a middleware-style streaming `next(arg)` callback.
-    pub async fn call_spread_with_arg0_and_stream_next(
+    pub(crate) async fn call_stream(
         &self,
-        build_arg0: Arg0Builder,
-        next: JsonStreamNextFn,
-    ) -> FlowResult<nemo_relay_runtime::api::runtime::LlmJsonStream> {
-        self.call_with_stream_next_inner(PrimaryArg::Build(build_arg0), true, Some(next), None)
+        invocation: Invocation,
+        cancellation: &StreamCancellation,
+    ) -> FlowResult<LlmJsonStream> {
+        self.call_stream_inner(invocation, None, Some(cancellation))
             .await
     }
 
-    /// Call the JS function and expose the `AsyncIterable` it returns as a lazy stream.
-    pub async fn call_stream(
+    pub(crate) async fn call_stream_with_next(
         &self,
-        args: Json,
-        stream_cancellation: &StreamCancellation,
-    ) -> FlowResult<nemo_relay_runtime::api::runtime::LlmJsonStream> {
-        self.call_with_stream_next_inner(
-            PrimaryArg::Json(args),
-            false,
-            None,
-            Some(stream_cancellation),
-        )
-        .await
+        invocation: Invocation,
+        next: JsonStreamNextFn,
+    ) -> FlowResult<LlmJsonStream> {
+        self.call_stream_inner(invocation, Some(next), None).await
     }
 
     fn tsfn(&self) -> FlowResult<Arc<PromiseTsfn>> {
@@ -749,13 +721,12 @@ impl PromiseAwareFn {
         })
     }
 
-    async fn call_with_stream_next_inner(
+    async fn call_stream_inner(
         &self,
-        arg0: PrimaryArg,
-        spread: bool,
+        invocation: Invocation,
         next: Option<JsonStreamNextFn>,
         stream_cancellation: Option<&StreamCancellation>,
-    ) -> FlowResult<nemo_relay_runtime::api::runtime::LlmJsonStream> {
+    ) -> FlowResult<LlmJsonStream> {
         let tsfn = self.tsfn()?;
         let call_id = self.calls.allocate();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
@@ -775,10 +746,10 @@ impl PromiseAwareFn {
             Ok(PromiseCall::Invoke(Box::new(CallArgs {
                 invoke: InvokeArgs {
                     call_id,
-                    arg0,
-                    spread,
+                    arg0: invocation.arg0,
+                    spread: invocation.spread,
                     next,
-                    publication: false,
+                    publication: invocation.publication,
                     publication_context_id: publication_callback_context_id(),
                     scope: CallbackScope::capture(),
                     stream_result: true,
@@ -798,18 +769,15 @@ impl PromiseAwareFn {
             .await
             .map_err(|e| FlowError::Internal(e.to_string()))??;
         cancellation_guard.disarm();
-        Ok(
-            nemo_relay_runtime::api::runtime::LlmJsonStream::from_closeable(JsCallbackStream {
-                receiver: tokio_stream::wrappers::ReceiverStream::new(chunk_receiver),
-                completion,
-                closed: closed_rx,
-                cancellation,
-            }),
-        )
+        Ok(LlmJsonStream::from_closeable(JsCallbackStream {
+            receiver: tokio_stream::wrappers::ReceiverStream::new(chunk_receiver),
+            completion,
+            closed: closed_rx,
+            cancellation,
+        }))
     }
 
-    /// Release the underlying threadsafe function so it does not outlive its registration.
-    pub fn close(&self) -> napi::Result<()> {
+    pub(crate) fn close(&self) -> napi::Result<()> {
         let tsfn = self
             .tsfn
             .write()
@@ -821,13 +789,7 @@ impl PromiseAwareFn {
         }
     }
 
-    async fn call_inner(
-        &self,
-        arg0: PrimaryArg,
-        spread: bool,
-        publication: bool,
-        next: Option<NextFn>,
-    ) -> FlowResult<Json> {
+    async fn call_inner(&self, invocation: Invocation, next: Option<NextFn>) -> FlowResult<Json> {
         let tsfn = self.tsfn()?;
         let call_id = self.calls.allocate();
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -837,10 +799,10 @@ impl PromiseAwareFn {
             Ok(PromiseCall::Invoke(Box::new(CallArgs {
                 invoke: InvokeArgs {
                     call_id,
-                    arg0,
-                    spread,
+                    arg0: invocation.arg0,
+                    spread: invocation.spread,
                     next,
-                    publication,
+                    publication: invocation.publication,
                     publication_context_id: publication_callback_context_id(),
                     scope: CallbackScope::capture(),
                     stream_result: false,

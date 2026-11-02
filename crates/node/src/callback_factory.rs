@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! JavaScript callback wrapper factories, cached once per environment.
-
 use napi::bindgen_prelude::{
     External, FnArgs, FromNapiRef, FromNapiValue, Function, FunctionRef, JsObjectValue, JsValue,
     JsValuesTupleIntoVec, Object, Unknown,
@@ -22,8 +20,23 @@ const CALLBACK_FACTORIES_SOURCE: &str = include_str!("callback_factories.js");
 
 type PromiseFactoryArgs = FnArgs<(JsArg, JsArg, JsArg, JsArg, JsArg, JsArg)>;
 
-/// Native functions a promise wrapper calls: `(resolve, reject, streamPush, streamEnd, next)`.
-pub(crate) type PromiseSettlers = FnArgs<(JsArg, JsArg, JsArg, JsArg, JsArg)>;
+pub(crate) struct Settlers {
+    pub(crate) resolve: JsArg,
+    pub(crate) reject: JsArg,
+    pub(crate) stream_push: JsArg,
+    pub(crate) stream_end: JsArg,
+    pub(crate) next: JsArg,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Wrapper {
+    Execution,
+    Middleware,
+    ConditionalGate,
+    Collector,
+    Finalizer,
+    Scoped,
+}
 
 pub(crate) struct Factories {
     execution: FunctionRef<JsArg, JsArg>,
@@ -81,6 +94,17 @@ impl Factories {
             set_callback_scope: reference(&factories, "setCallbackScope")?,
         })
     }
+
+    fn wrapper(&self, wrapper: Wrapper) -> &FunctionRef<JsArg, JsArg> {
+        match wrapper {
+            Wrapper::Execution => &self.execution,
+            Wrapper::Middleware => &self.middleware,
+            Wrapper::ConditionalGate => &self.conditional_gate,
+            Wrapper::Collector => &self.collector,
+            Wrapper::Finalizer => &self.finalizer,
+            Wrapper::Scoped => &self.scoped,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -127,47 +151,21 @@ fn wrapper_function<'env, Args: JsValuesTupleIntoVec, Return>(
     env: &'env Env,
     wrapper: JsArg,
 ) -> napi::Result<Function<'env, Args, Return>> {
+    // SAFETY: `wrapper` was returned by a factory call made by the caller, in `env`.
     Function::from_unknown(unsafe { wrapper.into_unknown(env) })
 }
 
-fn wrap<'env, Args: JsValuesTupleIntoVec, Return>(
+pub(crate) fn wrap<'env, Args: JsValuesTupleIntoVec, Return>(
     env: &'env Env,
-    factory: &FunctionRef<JsArg, JsArg>,
+    wrapper: Wrapper,
     func: &Function<JsArg, JsArg>,
 ) -> napi::Result<Function<'env, Args, Return>> {
-    wrapper_function(env, factory.borrow_back(env)?.call(detach(env, func))?)
-}
-
-/// Wrap an execution callback so a failure crosses N-API as an envelope.
-///
-/// JavaScript validates the return value as JSON, so a BigInt or a non-finite number
-/// is reported, not coerced.
-pub(crate) fn wrap_execution_callback<'env, Args: JsValuesTupleIntoVec, Return>(
-    env: &'env Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<Function<'env, Args, Return>> {
-    wrap(env, &environment::state(env)?.factories.execution, func)
-}
-
-/// Wrap a middleware callback so a thrown exception crosses N-API as an envelope.
-pub(crate) fn wrap_middleware_callback<'env, Args: JsValuesTupleIntoVec, Return>(
-    env: &'env Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<Function<'env, Args, Return>> {
-    wrap(env, &environment::state(env)?.factories.middleware, func)
-}
-
-/// Wrap a conditional registration gate so a throw or a value other than a string or
-/// null crosses N-API as an envelope.
-pub(crate) fn wrap_conditional_gate_callback<'env, Args: JsValuesTupleIntoVec, Return>(
-    env: &'env Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<Function<'env, Args, Return>> {
-    wrap(
-        env,
-        &environment::state(env)?.factories.conditional_gate,
-        func,
-    )
+    let wrapped = environment::state(env)?
+        .factories
+        .wrapper(wrapper)
+        .borrow_back(env)?
+        .call(detach(env, func))?;
+    wrapper_function(env, wrapped)
 }
 
 pub(crate) fn wrap_subscriber_callback<'env, Args: JsValuesTupleIntoVec, Return>(
@@ -186,43 +184,21 @@ pub(crate) fn wrap_subscriber_callback<'env, Args: JsValuesTupleIntoVec, Return>
 pub(crate) fn wrap_promise_callback<'env, Args: JsValuesTupleIntoVec, Return>(
     env: &'env Env,
     func: &Function<JsArg, JsArg>,
-    settlers: PromiseSettlers,
+    settlers: Settlers,
 ) -> napi::Result<Function<'env, Args, Return>> {
-    let (resolve, reject, stream_push, stream_end, next) = settlers.data;
     let wrapper = environment::state(env)?
         .factories
         .promise
         .borrow_back(env)?
         .call(FnArgs::from((
             detach(env, func),
-            resolve,
-            reject,
-            stream_push,
-            stream_end,
-            next,
+            settlers.resolve,
+            settlers.reject,
+            settlers.stream_push,
+            settlers.stream_end,
+            settlers.next,
         )))?;
     wrapper_function(env, wrapper)
-}
-
-pub(crate) fn wrap_collector_callback<'env, Args: JsValuesTupleIntoVec, Return>(
-    env: &'env Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<Function<'env, Args, Return>> {
-    wrap(env, &environment::state(env)?.factories.collector, func)
-}
-
-pub(crate) fn wrap_finalizer_callback<'env, Args: JsValuesTupleIntoVec, Return>(
-    env: &'env Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<Function<'env, Args, Return>> {
-    wrap(env, &environment::state(env)?.factories.finalizer, func)
-}
-
-pub(crate) fn wrap_scoped_callback<'env, Args: JsValuesTupleIntoVec, Return>(
-    env: &'env Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<Function<'env, Args, Return>> {
-    wrap(env, &environment::state(env)?.factories.scoped, func)
 }
 
 fn drive_stream<'env>(

@@ -1,14 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Public NAPI API functions for the NeMo Relay Node.js bindings.
-//!
-//! This module exposes the full agent runtime API to JavaScript/TypeScript:
-//! scope stack management, tool and LLM lifecycle operations, guardrail and
-//! intercept registration/deregistration, and event subscriber management.
-//! All functions are annotated with `#[napi]` and their doc comments appear
-//! in the generated `index.d.ts` TypeScript definitions.
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
@@ -54,17 +46,18 @@ use nemo_relay_plugin_host::{
 use nemo_relay_runtime::api::llm as core_llm_api;
 use nemo_relay_runtime::api::llm::{LlmAttributes, LlmRequest};
 use nemo_relay_runtime::api::registry as core_registry_api;
+use nemo_relay_runtime::api::registry::{
+    RuntimeRegistrationKind as CoreRuntimeRegistrationKind,
+    RuntimeRegistrationOwnerKind as CoreRuntimeRegistrationOwnerKind,
+};
 use nemo_relay_runtime::api::runtime::subscriber_dispatcher::with_nested_publication_buffer;
 use nemo_relay_runtime::api::runtime::{
     ConditionalMiddlewareGuardrailFn, LlmCollector, LlmExecutionNextFn, LlmFinalizer,
-    LlmJsonStream, ToolExecutionNextFn,
-};
-use nemo_relay_runtime::api::runtime::{
-    TASK_SCOPE_STACK, capture_propagation_context as capture_propagation_context_handle,
+    LlmJsonStream, PropagationContext as CorePropagationContext, TASK_SCOPE_STACK,
+    ToolExecutionNextFn, capture_propagation_context as capture_propagation_context_handle,
     capture_propagation_context_with_root as capture_propagation_context_with_root_handle,
     capture_rootless_propagation_context as capture_rootless_propagation_context_handle,
     capture_traceparent as capture_traceparent_handle,
-    create_scope_stack as create_scope_stack_handle,
     create_scope_stack_from_propagation as create_scope_stack_from_propagation_handle,
     current_scope_stack as current_scope_stack_handle, scope_stack_active as scope_stack_is_active,
     set_thread_scope_stack as bind_thread_scope_stack, task_scope_top,
@@ -80,28 +73,27 @@ use nemo_relay_types::codec::request::AnnotatedLlmRequest;
 use nemo_relay_types::codec::response::Usage;
 use nemo_relay_types::error::{FlowError, Result as FlowResult};
 
-pub(crate) const LLM_STREAM_BRIDGE_CAPACITY: usize = 32;
-
 use crate::callable;
-use crate::callback_factory::{self, CallbackScope};
+use crate::callback_factory::{self, CallbackScope, Wrapper};
 use crate::convert::{
-    Callback, JAVASCRIPT_MAX_SAFE_INTEGER, JsArg, JsArgs2, Tsfn,
+    BoxFuture, Callback, JAVASCRIPT_MAX_SAFE_INTEGER, JsArg, JsArgs2, Tsfn,
     clear_last_callback_error as clear_recorded_callback_error, closure_function, detach,
     get_last_callback_error as get_recorded_callback_error, js_value, lock, opt_json,
     parse_timestamp_micros, record_callback_error,
 };
 use crate::environment::spawn_promise;
 use crate::error::{Error, Result};
-use crate::promise_call::PromiseAwareFn;
-use crate::promise_call::with_publication_callback_context;
+use crate::promise_call::{Invocation, PromiseAwareFn, PublicationContext};
 use crate::stream::LlmStream;
 use crate::types::{
     DataSchema, LlmHandle, LogSeverity, MetricMeasurement, MetricTemporality, ScopeHandle,
-    ScopeStack, ScopeType, ToolExecutionResult, ToolHandle,
+    ScopeStack, ScopeType, ToolExecutionResult, ToolHandle, mirror_variants,
 };
 
 #[cfg(test)]
 mod llm_stack_tests;
+
+pub(crate) const LLM_STREAM_BRIDGE_CAPACITY: usize = 32;
 
 static NODE_ENVIRONMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NODE_ENVIRONMENT_LIFECYCLE_LOCK: StdMutex<()> = StdMutex::new(());
@@ -623,15 +615,19 @@ impl CallContext {
         with_callback_scope(&self.scope, callback)
     }
 
+    fn publication(&self) -> PublicationContext {
+        PublicationContext {
+            context_id: self.publication_context_id.clone(),
+            publication_buffer: self.scope.publication_buffer.clone(),
+        }
+    }
+
     fn run<F>(self, future: F) -> impl Future<Output = F::Output> + Send + 'static
     where
         F: Future + Send + 'static,
     {
-        with_publication_callback_context(
-            self.publication_context_id,
-            self.scope.publication_buffer,
-            TASK_SCOPE_STACK.scope(self.scope.scope_stack, future),
-        )
+        self.publication()
+            .run(TASK_SCOPE_STACK.scope(self.scope.scope_stack, future))
     }
 }
 
@@ -817,7 +813,6 @@ fn build_otel_config(
     Ok(config)
 }
 
-/// Parses the optional completed-span-context TTL shared by every trace config.
 fn parse_completed_span_context_ttl_millis(value: Option<BigInt>) -> Result<u64> {
     let parsed = value
         .map(|ttl| {
@@ -1052,14 +1047,13 @@ fn build_atof_config(
 
 pub(crate) fn llm_stream_from_rust_stream(
     rust_stream: LlmJsonStream,
-    publication_context_id: Option<String>,
+    publication: PublicationContext,
 ) -> LlmStream {
     LlmStream::new(
         rust_stream,
         Default::default(),
         Default::default(),
-        publication_context_id,
-        None,
+        publication,
     )
 }
 
@@ -1072,7 +1066,7 @@ fn scoped_json_callback_tsfn(
     env: &Env,
     func: &Function<JsArg, JsArg>,
 ) -> napi::Result<Tsfn<ScopedJsonCall, JsArgs2, JsArg>> {
-    callback_factory::wrap_scoped_callback::<JsArgs2, JsArg>(env, func)?
+    callback_factory::wrap::<JsArgs2, JsArg>(env, Wrapper::Scoped, func)?
         .build_threadsafe_function::<ScopedJsonCall>()
         .weak::<true>()
         .build_callback(|ctx: ThreadsafeCallContext<ScopedJsonCall>| {
@@ -1411,8 +1405,10 @@ fn node_conditional_middleware_guardrail(
 ) -> napi::Result<ConditionalMiddlewareGuardrailFn> {
     let callback = callable::SyncJsCallback::new(
         env,
-        callback_factory::wrap_conditional_gate_callback::<FnArgs<(Vec<String>, String)>, JsArg>(
-            env, guardrail,
+        callback_factory::wrap::<FnArgs<(Vec<String>, String)>, JsArg>(
+            env,
+            Wrapper::ConditionalGate,
+            guardrail,
         )?,
         CONDITIONAL_GATE_PREFIX,
         Some(CONDITIONAL_GATE_CALLBACK_TIMEOUT),
@@ -1557,10 +1553,6 @@ impl Plugin for NodePlugin {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Scope stack isolation
-// ---------------------------------------------------------------------------
-
 /// Transport-neutral Relay causal context for application-managed transport.
 #[napi(object)]
 pub struct PropagationContext {
@@ -1571,46 +1563,48 @@ pub struct PropagationContext {
     pub tracestate: Option<String>,
 }
 
-fn propagation_context_from_napi(
-    context: PropagationContext,
-) -> Result<nemo_relay_runtime::api::runtime::PropagationContext> {
-    let root_uuid = context
-        .root_uuid
-        .as_deref()
-        .map(uuid::Uuid::parse_str)
-        .transpose()
-        .map_err(|error| Error::invalid_argument(format!("invalid root UUID: {error}")))?;
-    let parent_uuid = uuid::Uuid::parse_str(&context.parent_uuid)
-        .map_err(|error| Error::invalid_argument(format!("invalid parent UUID: {error}")))?;
-    let version = u16::try_from(context.version)
-        .map_err(|_| Error::invalid_argument("propagation context version is out of range"))?;
-    let context = nemo_relay_runtime::api::runtime::PropagationContext {
-        version,
-        root_uuid,
-        parent_uuid,
-        traceparent: context.traceparent,
-        tracestate: context.tracestate,
-    };
-    context.validate().map_err(Error::from)?;
-    Ok(context)
+impl TryFrom<PropagationContext> for CorePropagationContext {
+    type Error = Error;
+
+    fn try_from(context: PropagationContext) -> Result<Self> {
+        let root_uuid = context
+            .root_uuid
+            .as_deref()
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .map_err(|error| Error::invalid_argument(format!("invalid root UUID: {error}")))?;
+        let parent_uuid = uuid::Uuid::parse_str(&context.parent_uuid)
+            .map_err(|error| Error::invalid_argument(format!("invalid parent UUID: {error}")))?;
+        let version = u16::try_from(context.version)
+            .map_err(|_| Error::invalid_argument("propagation context version is out of range"))?;
+        let context = Self {
+            version,
+            root_uuid,
+            parent_uuid,
+            traceparent: context.traceparent,
+            tracestate: context.tracestate,
+        };
+        context.validate()?;
+        Ok(context)
+    }
 }
 
-pub(crate) fn propagation_context_to_napi(
-    context: nemo_relay_runtime::api::runtime::PropagationContext,
-) -> PropagationContext {
-    PropagationContext {
-        version: u32::from(context.version),
-        root_uuid: context.root_uuid.map(|uuid| uuid.to_string()),
-        parent_uuid: context.parent_uuid.to_string(),
-        traceparent: context.traceparent,
-        tracestate: context.tracestate,
+impl From<CorePropagationContext> for PropagationContext {
+    fn from(context: CorePropagationContext) -> Self {
+        Self {
+            version: u32::from(context.version),
+            root_uuid: context.root_uuid.map(|uuid| uuid.to_string()),
+            parent_uuid: context.parent_uuid.to_string(),
+            traceparent: context.traceparent,
+            tracestate: context.tracestate,
+        }
     }
 }
 
 fn callback_propagation_context(
     scope: &CallbackScope,
-    mut context: nemo_relay_runtime::api::runtime::PropagationContext,
-) -> Result<nemo_relay_runtime::api::runtime::PropagationContext> {
+    mut context: CorePropagationContext,
+) -> Result<CorePropagationContext> {
     let stack = scope
         .scope_stack
         .read()
@@ -1638,8 +1632,8 @@ fn callback_propagation_context(
 
 fn rootless_callback_propagation_context(
     scope: &CallbackScope,
-    context: nemo_relay_runtime::api::runtime::PropagationContext,
-) -> Result<nemo_relay_runtime::api::runtime::PropagationContext> {
+    context: CorePropagationContext,
+) -> Result<CorePropagationContext> {
     let mut context = callback_propagation_context(scope, context)?;
     context.root_uuid = None;
     let rootless = with_callback_scope(scope, capture_rootless_propagation_context_handle)
@@ -1654,10 +1648,7 @@ fn rootless_callback_propagation_context(
 /// Creates a new isolated scope stack.
 #[napi(catch_unwind)]
 pub fn create_scope_stack() -> ScopeStack {
-    ScopeStack {
-        inner: create_scope_stack_handle(),
-        publication_buffer: None,
-    }
+    ScopeStack::new()
 }
 
 /// Capture the current Relay causal parent for application-managed transport.
@@ -1665,10 +1656,10 @@ pub fn create_scope_stack() -> ScopeStack {
 pub fn capture_propagation_context(env: Env) -> Result<PropagationContext> {
     let scope = effective_scope(&env)?;
     if let Some(context) = scope.propagation.clone() {
-        return callback_propagation_context(&scope, context).map(propagation_context_to_napi);
+        return callback_propagation_context(&scope, context).map(Into::into);
     }
     with_callback_scope(&scope, capture_propagation_context_handle)
-        .map(propagation_context_to_napi)
+        .map(Into::into)
         .map_err(Error::from)
 }
 
@@ -1677,11 +1668,10 @@ pub fn capture_propagation_context(env: Env) -> Result<PropagationContext> {
 pub fn capture_rootless_propagation_context(env: Env) -> Result<PropagationContext> {
     let scope = effective_scope(&env)?;
     if let Some(context) = scope.propagation.clone() {
-        return rootless_callback_propagation_context(&scope, context)
-            .map(propagation_context_to_napi);
+        return rootless_callback_propagation_context(&scope, context).map(Into::into);
     }
     with_callback_scope(&scope, capture_rootless_propagation_context_handle)
-        .map(propagation_context_to_napi)
+        .map(Into::into)
         .map_err(Error::from)
 }
 
@@ -1700,12 +1690,12 @@ pub fn capture_propagation_context_with_root(
     if let Some(context) = scope.propagation.clone() {
         let mut context = rootless_callback_propagation_context(&scope, context)?;
         context.root_uuid = root_uuid;
-        return Ok(propagation_context_to_napi(context));
+        return Ok(context.into());
     }
     with_callback_scope(&scope, || {
         capture_propagation_context_with_root_handle(root_uuid)
     })
-    .map(propagation_context_to_napi)
+    .map(Into::into)
     .map_err(Error::from)
 }
 
@@ -1725,7 +1715,7 @@ pub fn capture_traceparent(env: Env) -> Result<String> {
 /// Serialize a Relay causal context to the JSON wire format.
 #[napi(catch_unwind)]
 pub fn propagation_context_to_json(context: PropagationContext) -> Result<String> {
-    propagation_context_from_napi(context)?
+    CorePropagationContext::try_from(context)?
         .to_json()
         .map_err(Error::from)
 }
@@ -1733,7 +1723,7 @@ pub fn propagation_context_to_json(context: PropagationContext) -> Result<String
 /// Convert a Relay propagation context to a W3C `traceparent` value.
 #[napi(catch_unwind)]
 pub fn propagation_context_to_traceparent(context: PropagationContext) -> Result<String> {
-    propagation_context_from_napi(context)?
+    CorePropagationContext::try_from(context)?
         .to_traceparent()
         .map_err(Error::from)
 }
@@ -1741,15 +1731,15 @@ pub fn propagation_context_to_traceparent(context: PropagationContext) -> Result
 /// Deserialize and validate a Relay causal context from the JSON wire format.
 #[napi(catch_unwind)]
 pub fn propagation_context_from_json(value: String) -> Result<PropagationContext> {
-    nemo_relay_runtime::api::runtime::PropagationContext::from_json(&value)
-        .map(propagation_context_to_napi)
+    CorePropagationContext::from_json(&value)
+        .map(Into::into)
         .map_err(Error::from)
 }
 
 /// Create an isolated scope stack seeded from a received propagation context.
 #[napi(catch_unwind)]
 pub fn create_scope_stack_from_propagation(context: PropagationContext) -> Result<ScopeStack> {
-    create_scope_stack_from_propagation_handle(&propagation_context_from_napi(context)?)
+    create_scope_stack_from_propagation_handle(&CorePropagationContext::try_from(context)?)
         .map(ScopeStack::from)
         .map_err(Error::from)
 }
@@ -1853,8 +1843,7 @@ pub fn clear_last_callback_error() {
     clear_recorded_callback_error();
 }
 
-/// Resolve a stream callback future whose queue step already failed.
-fn settled_now<T>(mut future: Pin<Box<dyn Future<Output = T> + Send>>) -> Result<T> {
+fn settled_now<T>(mut future: BoxFuture<T>) -> Result<T> {
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     match future.as_mut().poll(&mut context) {
         std::task::Poll::Ready(value) => Ok(value),
@@ -1922,26 +1911,20 @@ pub fn test_closed_promise_aware_call<'env>(
     spawn_promise(
         env,
         async move {
-            if force_conversion_failure {
-                promise_aware
-                    .call_with_arg0(Box::new(|_| {
-                        Err(napi::Error::from_reason(
-                            "forced PromiseAwareFn conversion failure",
-                        ))
-                    }))
-                    .await
+            let invocation = if force_conversion_failure {
+                Invocation::built(|_| {
+                    Err(napi::Error::from_reason(
+                        "forced PromiseAwareFn conversion failure",
+                    ))
+                })
             } else {
-                promise_aware.call(Json::Null).await
-            }
-            .map_err(Error::from)
+                Invocation::single(Json::Null)
+            };
+            promise_aware.call(invocation).await.map_err(Error::from)
         },
         js_value,
     )
 }
-
-// ---------------------------------------------------------------------------
-// Scope / handle operations
-// ---------------------------------------------------------------------------
 
 /// Get the handle for the current top-of-stack execution scope.
 ///
@@ -2079,10 +2062,11 @@ pub fn with_scope<'env>(
     spawn_promise(
         env,
         context.run(async move {
-            let build_handle: crate::promise_call::Arg0Builder =
-                Box::new(move |env: &Env| js_value(env, ScopeHandle::from(scope_handle)));
-
-            let result = pa_fn.call_with_arg0(build_handle).await;
+            let result = pa_fn
+                .call(Invocation::built(move |env| {
+                    js_value(env, ScopeHandle::from(scope_handle))
+                }))
+                .await;
             let metadata = match &result {
                 Ok(_) => otel_status_metadata("OK", None),
                 Err(error) => otel_status_metadata("ERROR", Some(error.to_string())),
@@ -2175,10 +2159,6 @@ pub fn metric(
     })?
     .map_err(Error::from)
 }
-
-// ---------------------------------------------------------------------------
-// Tool lifecycle
-// ---------------------------------------------------------------------------
 
 /// Begin a manual tool call lifecycle span.
 ///
@@ -2281,7 +2261,7 @@ pub fn tool_call_execute<'env>(
     let attrs = ToolAttributes::from_bits_truncate(attributes.unwrap_or(0));
     let context = CallContext::capture(env)?;
     let parent = context.parent(handle);
-    let callback: Function<JsArg, JsArg> = callback_factory::wrap_execution_callback(env, &func)?;
+    let callback: Function<JsArg, JsArg> = callback_factory::wrap(env, Wrapper::Execution, &func)?;
     let default_fn = scoped_tool_execution_fn(scoped_json_callback_tsfn(env, &callback)?);
 
     spawn_promise(
@@ -2336,7 +2316,7 @@ pub fn tool_call_execute_async<'env>(
     let exec_fn: ToolExecutionNextFn = Arc::new(move |args| {
         let pa_fn = pa_fn.clone();
         Box::pin(async move {
-            let result = pa_fn.call(args).await?;
+            let result = pa_fn.call(Invocation::single(args)).await?;
             callable::parse_tool_execution_result(result)
         })
     });
@@ -2363,10 +2343,6 @@ pub fn tool_call_execute_async<'env>(
         js_value,
     )
 }
-
-// ---------------------------------------------------------------------------
-// LLM lifecycle
-// ---------------------------------------------------------------------------
 
 /// Begin a manual LLM call lifecycle span.
 ///
@@ -2485,7 +2461,7 @@ pub fn llm_call_execute<'env>(
     let parent = context.parent(handle);
     let llm_request: LlmRequest = serde_json::from_value(request)
         .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-    let callback: Function<JsArg, JsArg> = callback_factory::wrap_execution_callback(env, &func)?;
+    let callback: Function<JsArg, JsArg> = callback_factory::wrap(env, Wrapper::Execution, &func)?;
     let default_fn = scoped_llm_execution_fn(scoped_json_callback_tsfn(env, &callback)?);
     let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
     let response_codec = node_llm_response_codec(env, response_codec_decode.as_deref())?;
@@ -2541,7 +2517,11 @@ pub fn llm_call_execute_async<'env>(
 
     let exec_fn: LlmExecutionNextFn = Arc::new(move |request| {
         let pa_fn = pa_fn.clone();
-        Box::pin(async move { pa_fn.call(serialize_llm_request(&request)?).await })
+        Box::pin(async move {
+            pa_fn
+                .call(Invocation::single(serialize_llm_request(&request)?))
+                .await
+        })
     });
 
     let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
@@ -2636,9 +2616,8 @@ pub fn llm_stream_call_execute<'env>(
 
     let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
     let response_codec = node_llm_response_codec(env, response_codec_decode.as_deref())?;
-    let stream_context_id = context.publication_context_id.clone();
-    let stream_publication_buffer = context.scope.publication_buffer.clone();
-    spawn_promise::<_, _, Error, _, _>(
+    let publication = context.publication();
+    spawn_promise(
         env,
         context.run(async move {
             let params = core_llm_api::LlmStreamCallExecuteParams::builder()
@@ -2658,22 +2637,16 @@ pub fn llm_stream_call_execute<'env>(
             let rust_stream = Box::pin(core_llm_api::llm_stream_call_execute(params))
                 .await
                 .map_err(Error::from)?;
-
-            Ok(LlmStream::new(
+            Ok::<_, Error>(LlmStream::new(
                 rust_stream,
                 finalizer_error,
                 producers,
-                stream_context_id,
-                stream_publication_buffer,
+                publication,
             ))
         }),
         js_value,
     )
 }
-
-// ---------------------------------------------------------------------------
-// Event metadata injector and event guardrail registrations
-// ---------------------------------------------------------------------------
 
 /// Register a global event metadata injector.
 ///
@@ -2723,97 +2696,24 @@ pub enum RuntimeRegistrationKind {
     LlmStreamExecutionIntercept,
 }
 
-impl From<RuntimeRegistrationKind> for core_registry_api::RuntimeRegistrationKind {
-    fn from(kind: RuntimeRegistrationKind) -> Self {
-        match kind {
-            RuntimeRegistrationKind::Subscriber => Self::Subscriber,
-            RuntimeRegistrationKind::EventMetadataInjector => Self::EventMetadataInjector,
-            RuntimeRegistrationKind::MarkSanitizeGuardrail => Self::MarkSanitizeGuardrail,
-            RuntimeRegistrationKind::ScopeSanitizeStartGuardrail => {
-                Self::ScopeSanitizeStartGuardrail
-            }
-            RuntimeRegistrationKind::ScopeSanitizeEndGuardrail => Self::ScopeSanitizeEndGuardrail,
-            RuntimeRegistrationKind::ToolSanitizeRequestGuardrail => {
-                Self::ToolSanitizeRequestGuardrail
-            }
-            RuntimeRegistrationKind::ToolSanitizeResponseGuardrail => {
-                Self::ToolSanitizeResponseGuardrail
-            }
-            RuntimeRegistrationKind::ToolConditionalExecutionGuardrail => {
-                Self::ToolConditionalExecutionGuardrail
-            }
-            RuntimeRegistrationKind::ToolRequestIntercept => Self::ToolRequestIntercept,
-            RuntimeRegistrationKind::ToolExecutionIntercept => Self::ToolExecutionIntercept,
-            RuntimeRegistrationKind::LlmSanitizeRequestGuardrail => {
-                Self::LlmSanitizeRequestGuardrail
-            }
-            RuntimeRegistrationKind::LlmSanitizeResponseGuardrail => {
-                Self::LlmSanitizeResponseGuardrail
-            }
-            RuntimeRegistrationKind::LlmConditionalExecutionGuardrail => {
-                Self::LlmConditionalExecutionGuardrail
-            }
-            RuntimeRegistrationKind::LlmRequestIntercept => Self::LlmRequestIntercept,
-            RuntimeRegistrationKind::LlmExecutionIntercept => Self::LlmExecutionIntercept,
-            RuntimeRegistrationKind::LlmStreamExecutionIntercept => {
-                Self::LlmStreamExecutionIntercept
-            }
-        }
-    }
-}
-
-impl From<core_registry_api::RuntimeRegistrationKind> for RuntimeRegistrationKind {
-    fn from(kind: core_registry_api::RuntimeRegistrationKind) -> Self {
-        match kind {
-            core_registry_api::RuntimeRegistrationKind::Subscriber => Self::Subscriber,
-            core_registry_api::RuntimeRegistrationKind::EventMetadataInjector => {
-                Self::EventMetadataInjector
-            }
-            core_registry_api::RuntimeRegistrationKind::MarkSanitizeGuardrail => {
-                Self::MarkSanitizeGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::ScopeSanitizeStartGuardrail => {
-                Self::ScopeSanitizeStartGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::ScopeSanitizeEndGuardrail => {
-                Self::ScopeSanitizeEndGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::ToolSanitizeRequestGuardrail => {
-                Self::ToolSanitizeRequestGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::ToolSanitizeResponseGuardrail => {
-                Self::ToolSanitizeResponseGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::ToolConditionalExecutionGuardrail => {
-                Self::ToolConditionalExecutionGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::ToolRequestIntercept => {
-                Self::ToolRequestIntercept
-            }
-            core_registry_api::RuntimeRegistrationKind::ToolExecutionIntercept => {
-                Self::ToolExecutionIntercept
-            }
-            core_registry_api::RuntimeRegistrationKind::LlmSanitizeRequestGuardrail => {
-                Self::LlmSanitizeRequestGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::LlmSanitizeResponseGuardrail => {
-                Self::LlmSanitizeResponseGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::LlmConditionalExecutionGuardrail => {
-                Self::LlmConditionalExecutionGuardrail
-            }
-            core_registry_api::RuntimeRegistrationKind::LlmRequestIntercept => {
-                Self::LlmRequestIntercept
-            }
-            core_registry_api::RuntimeRegistrationKind::LlmExecutionIntercept => {
-                Self::LlmExecutionIntercept
-            }
-            core_registry_api::RuntimeRegistrationKind::LlmStreamExecutionIntercept => {
-                Self::LlmStreamExecutionIntercept
-            }
-        }
-    }
-}
+mirror_variants!(RuntimeRegistrationKind <=> CoreRuntimeRegistrationKind {
+    Subscriber,
+    EventMetadataInjector,
+    MarkSanitizeGuardrail,
+    ScopeSanitizeStartGuardrail,
+    ScopeSanitizeEndGuardrail,
+    ToolSanitizeRequestGuardrail,
+    ToolSanitizeResponseGuardrail,
+    ToolConditionalExecutionGuardrail,
+    ToolRequestIntercept,
+    ToolExecutionIntercept,
+    LlmSanitizeRequestGuardrail,
+    LlmSanitizeResponseGuardrail,
+    LlmConditionalExecutionGuardrail,
+    LlmRequestIntercept,
+    LlmExecutionIntercept,
+    LlmStreamExecutionIntercept,
+});
 
 /// The owner category reported for a global runtime registration.
 #[napi(string_enum = "snake_case")]
@@ -2822,6 +2722,12 @@ pub enum RuntimeRegistrationOwnerKind {
     GlobalApi,
     Plugin,
 }
+
+mirror_variants!(RuntimeRegistrationOwnerKind <=> CoreRuntimeRegistrationOwnerKind {
+    Core,
+    GlobalApi,
+    Plugin,
+});
 
 /// Discovery metadata describing the owner of a runtime registration.
 #[napi(object)]
@@ -2842,23 +2748,12 @@ pub struct RuntimeRegistrationIdentity {
 
 impl From<core_registry_api::RuntimeRegistrationIdentity> for RuntimeRegistrationIdentity {
     fn from(identity: core_registry_api::RuntimeRegistrationIdentity) -> Self {
-        let owner_kind = match identity.owner.kind {
-            core_registry_api::RuntimeRegistrationOwnerKind::Core => {
-                RuntimeRegistrationOwnerKind::Core
-            }
-            core_registry_api::RuntimeRegistrationOwnerKind::GlobalApi => {
-                RuntimeRegistrationOwnerKind::GlobalApi
-            }
-            core_registry_api::RuntimeRegistrationOwnerKind::Plugin => {
-                RuntimeRegistrationOwnerKind::Plugin
-            }
-        };
         Self {
             kind: identity.kind.into(),
             local_name: identity.local_name,
             effective_name: identity.effective_name,
             owner: RuntimeRegistrationOwner {
-                kind: owner_kind,
+                kind: identity.owner.kind.into(),
                 plugin_kind: identity.owner.plugin_kind,
                 component_ordinal: identity.owner.component_ordinal,
             },
@@ -2959,8 +2854,6 @@ napi_event_guardrail_api!(
     core_registry_api::deregister_scope_sanitize_end_guardrail
 );
 
-// Written as `#[doc]` attributes: a `///` comment forwarded through `macro_rules!` reaches
-// napi-derive as a raw string literal and leaks `r"` into generated declarations.
 macro_rules! napi_guardrail_tool_api {
     ($(#[doc = $reg_doc:expr_2021])* $register_name:ident,
      $(#[doc = $dereg_doc:expr_2021])* $deregister_name:ident,
@@ -3055,10 +2948,6 @@ pub fn deregister_tool_conditional_execution_guardrail(name: String) -> Result<b
     core_registry_api::deregister_tool_conditional_execution_guardrail(&name).map_err(Error::from)
 }
 
-// ---------------------------------------------------------------------------
-// Tool intercept registrations
-// ---------------------------------------------------------------------------
-
 macro_rules! napi_intercept_tool_api {
     ($(#[doc = $reg_doc:expr_2021])* $register_name:ident,
      $(#[doc = $dereg_doc:expr_2021])* $deregister_name:ident,
@@ -3140,10 +3029,6 @@ pub fn register_tool_execution_intercept(
 pub fn deregister_tool_execution_intercept(name: String) -> Result<bool> {
     core_registry_api::deregister_tool_execution_intercept(&name).map_err(Error::from)
 }
-
-// ---------------------------------------------------------------------------
-// LLM guardrail registrations
-// ---------------------------------------------------------------------------
 
 /// Register a guardrail that sanitizes LLM request data before execution.
 ///
@@ -3237,10 +3122,6 @@ pub fn register_llm_conditional_execution_guardrail(
 pub fn deregister_llm_conditional_execution_guardrail(name: String) -> Result<bool> {
     core_registry_api::deregister_llm_conditional_execution_guardrail(&name).map_err(Error::from)
 }
-
-// ---------------------------------------------------------------------------
-// LLM intercept registrations
-// ---------------------------------------------------------------------------
 
 /// Register an intercept that transforms LLM request data.
 ///
@@ -3346,10 +3227,6 @@ pub fn deregister_llm_stream_execution_intercept(name: String) -> Result<bool> {
     core_registry_api::deregister_llm_stream_execution_intercept(&name).map_err(Error::from)
 }
 
-// ---------------------------------------------------------------------------
-// Subscriber registrations
-// ---------------------------------------------------------------------------
-
 /// Register a named event subscriber that receives all lifecycle events.
 ///
 /// The `callback` receives each event as the canonical JSON event object and may return a
@@ -3409,10 +3286,6 @@ pub fn flush_subscribers<'env>(env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
         |env, _| js_value(env, ()),
     )
 }
-
-// ---------------------------------------------------------------------------
-// Scope-local event metadata injector and event guardrail registrations
-// ---------------------------------------------------------------------------
 
 /// Register an event metadata injector owned by an active scope.
 #[napi(catch_unwind)]
@@ -3607,10 +3480,6 @@ pub fn scope_deregister_tool_conditional_execution_guardrail(
         .map_err(Error::from)
 }
 
-// ---------------------------------------------------------------------------
-// Scope-local intercept registrations — Tool
-// ---------------------------------------------------------------------------
-
 macro_rules! napi_scope_intercept_tool_api {
     ($(#[doc = $reg_doc:expr_2021])* $register_name:ident,
      $(#[doc = $dereg_doc:expr_2021])* $deregister_name:ident,
@@ -3701,10 +3570,6 @@ pub fn scope_deregister_tool_execution_intercept(scope_uuid: String, name: Strin
     let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_tool_execution_intercept(&uuid, &name).map_err(Error::from)
 }
-
-// ---------------------------------------------------------------------------
-// Scope-local guardrail registrations — LLM
-// ---------------------------------------------------------------------------
 
 /// Register a scope-local guardrail that sanitizes LLM request data before execution.
 ///
@@ -3824,10 +3689,6 @@ pub fn scope_deregister_llm_conditional_execution_guardrail(
     core_registry_api::scope_deregister_llm_conditional_execution_guardrail(&uuid, &name)
         .map_err(Error::from)
 }
-
-// ---------------------------------------------------------------------------
-// Scope-local intercept registrations — LLM
-// ---------------------------------------------------------------------------
 
 /// Register a scope-local intercept that transforms LLM request data.
 ///
@@ -3949,10 +3810,6 @@ pub fn scope_deregister_llm_stream_execution_intercept(
         .map_err(Error::from)
 }
 
-// ---------------------------------------------------------------------------
-// Scope-local subscriber registrations
-// ---------------------------------------------------------------------------
-
 /// Register a scope-local named event subscriber that receives lifecycle events
 /// for the specified scope.
 ///
@@ -3981,10 +3838,6 @@ pub fn scope_deregister_subscriber(scope_uuid: String, name: String) -> Result<b
     let uuid = parse_scope_uuid(&scope_uuid)?;
     core_subscriber_api::scope_deregister_subscriber(&uuid, &name).map_err(Error::from)
 }
-
-// ---------------------------------------------------------------------------
-// Standalone middleware chains
-// ---------------------------------------------------------------------------
 
 /// Run the registered tool request intercept chain on the given arguments.
 /// Returns the transformed arguments.
@@ -4078,10 +3931,6 @@ pub fn llm_conditional_execution<'env>(
         |env, _| js_value(env, ()),
     )
 }
-
-// ---------------------------------------------------------------------------
-// Agent Trajectory Interchange Format (ATIF) Exporter
-// ---------------------------------------------------------------------------
 
 /// An Agent Trajectory Interchange Format (ATIF) exporter that collects lifecycle
 /// events and exports them as a structured trajectory.
@@ -4376,8 +4225,6 @@ fn build_otel_file_sink_config(
                     .instrumentation_scope
                     .unwrap_or_else(|| "opentelemetry".to_string()),
             );
-    // An omitted service name stays unset so the SDK can detect it from
-    // OTEL_SERVICE_NAME, matching the plugin configuration path.
     if let Some(service_name) = options.service_name {
         config = config.with_service_name(service_name);
     }
@@ -5023,14 +4870,14 @@ pub fn register_plugin(
         .map(|func| {
             callable::SyncJsCallback::new(
                 &env,
-                callback_factory::wrap_middleware_callback(&env, &func)?,
+                callback_factory::wrap(&env, Wrapper::Middleware, &func)?,
                 PLUGIN_VALIDATE_PREFIX,
                 None,
             )
         })
         .transpose()?;
     let register: Function<JsArgs2, JsArg> =
-        callback_factory::wrap_middleware_callback(&env, &register)?;
+        callback_factory::wrap(&env, Wrapper::Middleware, &register)?;
     let register_tsfn = register
         .build_threadsafe_function::<NodePluginRegisterCall>()
         .weak::<true>()
@@ -5074,7 +4921,7 @@ pub struct PluginHostActivation {
 type DynamicPluginTeardownResult = std::result::Result<(), Arc<Error>>;
 
 enum DynamicPluginCloseStatus {
-    Active(Box<Option<CorePluginHostActivation>>),
+    Active(Box<CorePluginHostActivation>),
     Closing,
     Closed,
 }
@@ -5090,7 +4937,7 @@ impl DynamicPluginCloseState {
         let (completion, _) = tokio::sync::watch::channel(None);
         let report = activation.report();
         Self {
-            status: StdMutex::new(DynamicPluginCloseStatus::Active(Box::new(Some(activation)))),
+            status: StdMutex::new(DynamicPluginCloseStatus::Active(Box::new(activation))),
             report: StdMutex::new(report),
             completion,
         }
@@ -5098,10 +4945,7 @@ impl DynamicPluginCloseState {
 
     fn report(&self) -> PluginHostReport {
         let latest = match &*lock(&self.status) {
-            DynamicPluginCloseStatus::Active(activation) => activation
-                .as_ref()
-                .as_ref()
-                .map(CorePluginHostActivation::report),
+            DynamicPluginCloseStatus::Active(activation) => Some(activation.report()),
             DynamicPluginCloseStatus::Closing | DynamicPluginCloseStatus::Closed => None,
         };
         let mut report = lock(&self.report);
@@ -5112,36 +4956,27 @@ impl DynamicPluginCloseState {
     }
 
     fn active(&self) -> bool {
-        match &*lock(&self.status) {
-            DynamicPluginCloseStatus::Active(activation) => activation.as_ref().is_some(),
-            DynamicPluginCloseStatus::Closing | DynamicPluginCloseStatus::Closed => false,
-        }
+        matches!(&*lock(&self.status), DynamicPluginCloseStatus::Active(_))
+    }
+
+    fn take_active(&self) -> Option<Box<CorePluginHostActivation>> {
+        let mut status = lock(&self.status);
+        let activation = match std::mem::replace(&mut *status, DynamicPluginCloseStatus::Closing) {
+            DynamicPluginCloseStatus::Active(activation) => activation,
+            other => {
+                *status = other;
+                return None;
+            }
+        };
+        *lock(&self.report) = activation.report();
+        self.completion.send_replace(None);
+        Some(activation)
     }
 
     fn begin_close(self: &Arc<Self>, log_finalizer_error: bool) {
-        let activation = {
-            let mut status = lock(&self.status);
-            match &mut *status {
-                DynamicPluginCloseStatus::Active(activation) => {
-                    if let Some(current) = activation.as_ref().as_ref() {
-                        *lock(&self.report) = current.report();
-                    }
-                    let activation = activation.as_mut().take();
-                    if activation.is_some() {
-                        self.completion.send_replace(None);
-                    }
-                    *status = DynamicPluginCloseStatus::Closing;
-                    activation
-                }
-                DynamicPluginCloseStatus::Closing | DynamicPluginCloseStatus::Closed => None,
-            }
-        };
-        let Some(activation) = activation else {
+        let Some(activation) = self.take_active() else {
             return;
         };
-
-        // Keep the activation outside the spawned closure so a thread-spawn
-        // failure cannot drop it and synchronously run teardown on the JS thread.
         let activation = Arc::new(StdMutex::new(Some(activation)));
         let worker_activation = Arc::clone(&activation);
         let close_state = Arc::clone(self);
@@ -5179,8 +5014,6 @@ impl DynamicPluginCloseState {
                 "failed to start dynamic plugin teardown task: {error}"
             )));
             if log_finalizer_error {
-                // There is no caller left to retry, and teardown must not run
-                // synchronously on the JS finalizer thread.
                 if let Some(activation) = activation {
                     std::mem::forget(activation);
                 }
@@ -5194,7 +5027,7 @@ impl DynamicPluginCloseState {
 
     fn finish(
         &self,
-        activation: Option<CorePluginHostActivation>,
+        activation: Option<Box<CorePluginHostActivation>>,
         result: DynamicPluginTeardownResult,
     ) {
         self.finish_with_hook(activation, result, || {});
@@ -5202,19 +5035,16 @@ impl DynamicPluginCloseState {
 
     fn finish_with_hook(
         &self,
-        activation: Option<CorePluginHostActivation>,
+        activation: Option<Box<CorePluginHostActivation>>,
         result: DynamicPluginTeardownResult,
         before_publish: impl FnOnce(),
     ) {
-        let retryable = result.is_err()
-            && activation
-                .as_ref()
-                .is_some_and(CorePluginHostActivation::is_active);
         let mut status = lock(&self.status);
-        *status = if retryable {
-            DynamicPluginCloseStatus::Active(Box::new(activation))
-        } else {
-            DynamicPluginCloseStatus::Closed
+        *status = match activation {
+            Some(activation) if result.is_err() && activation.is_active() => {
+                DynamicPluginCloseStatus::Active(activation)
+            }
+            _ => DynamicPluginCloseStatus::Closed,
         };
         before_publish();
         self.completion.send_replace(Some(result));
@@ -5294,7 +5124,7 @@ pub fn initialize<'env>(
     config: Json,
     additional_plugins_toml: Option<String>,
 ) -> Result<PromiseRaw<'env, PluginHostActivation>> {
-    spawn_promise::<_, _, Error, _, _>(
+    spawn_promise(
         env,
         async move {
             let config: nemo_relay_plugin_host::dynamic::PluginHostConfig =
@@ -5304,7 +5134,7 @@ pub fn initialize<'env>(
             let activation = initialize_impl(config, additional_plugins_toml.map(Into::into))
                 .await
                 .map_err(Error::from)?;
-            Ok(PluginHostActivation {
+            Ok::<_, Error>(PluginHostActivation {
                 close_state: Arc::new(DynamicPluginCloseState::new(activation)),
             })
         },

@@ -1,12 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Type definitions for the NeMo Relay Node.js NAPI bindings.
-//!
-//! Contains enums, handle wrappers, request/response structures, event types,
-//! and attribute constants that are exposed to JavaScript/TypeScript consumers.
-//! Doc comments on `#[napi]` items are emitted into the generated `index.d.ts`.
-
 mod resource_metrics;
 
 use std::sync::Arc;
@@ -22,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
 use nemo_relay_codecs::resolve::ProviderSurface;
+use nemo_relay_observability::otel_metrics::MetricTemporality as CoreMetricTemporality;
 use nemo_relay_runtime::api::event::{
-    DataSchema as CoreDataSchema, Event, LogSeverity as CoreLogSeverity,
-    MetricKind as CoreMetricKind, MetricMeasurement as CoreMetricMeasurement,
-    MetricValueType as CoreMetricValueType,
+    DataSchema as CoreDataSchema, LogSeverity as CoreLogSeverity, MetricKind as CoreMetricKind,
+    MetricMeasurement as CoreMetricMeasurement, MetricValueType as CoreMetricValueType,
 };
 use nemo_relay_runtime::api::llm::{LlmHandle as CoreLlmHandle, LlmRequest as CoreLlmRequest};
 use nemo_relay_runtime::api::scope::{ScopeHandle as CoreScopeHandle, ScopeType as CoreScopeType};
@@ -34,6 +28,31 @@ use nemo_relay_runtime::api::tool::{
 };
 use nemo_relay_types::codec::request::AnnotatedLlmRequest;
 use nemo_relay_types::codec::traits::{LlmCodec, LlmResponseCodec};
+
+macro_rules! mirror_variants {
+    ($local:ident <=> $core:ident { $($variant:ident),+ $(,)? }) => {
+        mirror_variants!($local => $core { $($variant),+ });
+
+        impl From<$core> for $local {
+            fn from(value: $core) -> Self {
+                match value {
+                    $($core::$variant => Self::$variant,)+
+                }
+            }
+        }
+    };
+    ($local:ident => $core:ident { $($variant:ident),+ $(,)? }) => {
+        impl From<$local> for $core {
+            fn from(value: $local) -> Self {
+                match value {
+                    $($local::$variant => Self::$variant,)+
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use mirror_variants;
 
 /// Identity of one visible Relay scope.
 #[napi(object)]
@@ -66,10 +85,6 @@ impl From<nemo_relay_runtime::api::runtime::ScopeStackSnapshot> for ScopeStackSn
     }
 }
 
-// ---------------------------------------------------------------------------
-// Enums
-// ---------------------------------------------------------------------------
-
 /// The type of an execution scope in the agent runtime hierarchy.
 #[napi]
 pub enum ScopeType {
@@ -97,41 +112,10 @@ pub enum ScopeType {
     Unknown,
 }
 
-impl From<ScopeType> for CoreScopeType {
-    fn from(v: ScopeType) -> Self {
-        match v {
-            ScopeType::Agent => CoreScopeType::Agent,
-            ScopeType::Function => CoreScopeType::Function,
-            ScopeType::Tool => CoreScopeType::Tool,
-            ScopeType::Llm => CoreScopeType::Llm,
-            ScopeType::Retriever => CoreScopeType::Retriever,
-            ScopeType::Embedder => CoreScopeType::Embedder,
-            ScopeType::Reranker => CoreScopeType::Reranker,
-            ScopeType::Guardrail => CoreScopeType::Guardrail,
-            ScopeType::Evaluator => CoreScopeType::Evaluator,
-            ScopeType::Custom => CoreScopeType::Custom,
-            ScopeType::Unknown => CoreScopeType::Unknown,
-        }
-    }
-}
-
-impl From<CoreScopeType> for ScopeType {
-    fn from(v: CoreScopeType) -> Self {
-        match v {
-            CoreScopeType::Agent => ScopeType::Agent,
-            CoreScopeType::Function => ScopeType::Function,
-            CoreScopeType::Tool => ScopeType::Tool,
-            CoreScopeType::Llm => ScopeType::Llm,
-            CoreScopeType::Retriever => ScopeType::Retriever,
-            CoreScopeType::Embedder => ScopeType::Embedder,
-            CoreScopeType::Reranker => ScopeType::Reranker,
-            CoreScopeType::Guardrail => ScopeType::Guardrail,
-            CoreScopeType::Evaluator => ScopeType::Evaluator,
-            CoreScopeType::Custom => ScopeType::Custom,
-            CoreScopeType::Unknown => ScopeType::Unknown,
-        }
-    }
-}
+mirror_variants!(ScopeType <=> CoreScopeType {
+    Agent, Function, Tool, Llm, Retriever, Embedder, Reranker, Guardrail, Evaluator, Custom,
+    Unknown,
+});
 
 /// Severity attached to a mark projected as an OpenTelemetry log.
 #[napi]
@@ -143,17 +127,7 @@ pub enum LogSeverity {
     Error,
 }
 
-impl From<LogSeverity> for CoreLogSeverity {
-    fn from(value: LogSeverity) -> Self {
-        match value {
-            LogSeverity::Trace => Self::Trace,
-            LogSeverity::Debug => Self::Debug,
-            LogSeverity::Info => Self::Info,
-            LogSeverity::Warn => Self::Warn,
-            LogSeverity::Error => Self::Error,
-        }
-    }
-}
+mirror_variants!(LogSeverity => CoreLogSeverity { Trace, Debug, Info, Warn, Error });
 
 /// OpenTelemetry instrument kind recorded by a metric measurement.
 #[napi]
@@ -164,16 +138,7 @@ pub enum MetricKind {
     Histogram,
 }
 
-impl From<MetricKind> for CoreMetricKind {
-    fn from(value: MetricKind) -> Self {
-        match value {
-            MetricKind::Counter => Self::Counter,
-            MetricKind::UpDownCounter => Self::UpDownCounter,
-            MetricKind::Gauge => Self::Gauge,
-            MetricKind::Histogram => Self::Histogram,
-        }
-    }
-}
+mirror_variants!(MetricKind => CoreMetricKind { Counter, UpDownCounter, Gauge, Histogram });
 
 /// Explicit numeric representation used by a metric measurement.
 #[napi]
@@ -183,6 +148,8 @@ pub enum MetricValueType {
     F64,
 }
 
+mirror_variants!(MetricValueType => CoreMetricValueType { U64, I64, F64 });
+
 /// Preferred aggregation temporality for OTLP metric export.
 #[napi]
 pub enum MetricTemporality {
@@ -191,25 +158,7 @@ pub enum MetricTemporality {
     LowMemory,
 }
 
-impl From<MetricTemporality> for nemo_relay_observability::otel_metrics::MetricTemporality {
-    fn from(value: MetricTemporality) -> Self {
-        match value {
-            MetricTemporality::Cumulative => Self::Cumulative,
-            MetricTemporality::Delta => Self::Delta,
-            MetricTemporality::LowMemory => Self::LowMemory,
-        }
-    }
-}
-
-impl From<MetricValueType> for CoreMetricValueType {
-    fn from(value: MetricValueType) -> Self {
-        match value {
-            MetricValueType::U64 => Self::U64,
-            MetricValueType::I64 => Self::I64,
-            MetricValueType::F64 => Self::F64,
-        }
-    }
-}
+mirror_variants!(MetricTemporality => CoreMetricTemporality { Cumulative, Delta, LowMemory });
 
 /// Schema identifier attached to an event's opaque data payload.
 #[napi(object)]
@@ -255,10 +204,6 @@ impl From<MetricMeasurement> for CoreMetricMeasurement {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Handle wrappers
-// ---------------------------------------------------------------------------
 
 /// Canonical application-visible result of tool execution.
 ///
@@ -489,10 +434,6 @@ impl From<CoreLlmHandle> for LlmHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LlmRequest
-// ---------------------------------------------------------------------------
-
 /// An LLM request, encapsulating headers and content.
 ///
 /// Construct via `new LlmRequest(headers, content)`.
@@ -528,10 +469,6 @@ impl LlmRequest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Event (read-only, for subscribers)
-// ---------------------------------------------------------------------------
-
 /// Observability fields returned by mark and scope event sanitizers.
 #[napi(object)]
 #[derive(Deserialize, Serialize)]
@@ -560,25 +497,6 @@ pub(crate) fn event_sanitize_fields_from_json(
     }
     serde_json::from_value(value)
 }
-
-// ---------------------------------------------------------------------------
-
-/// A read-only ATOF lifecycle event delivered to subscribers.
-pub struct JsEvent(serde_json::Value);
-
-impl JsEvent {
-    pub(crate) fn try_from_event(e: &Event) -> serde_json::Result<Self> {
-        Ok(Self(e.try_to_json_value()?))
-    }
-
-    pub(crate) fn into_json(self) -> serde_json::Value {
-        self.0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Built-in codec classes
-// ---------------------------------------------------------------------------
 
 fn decode_request(codec: &dyn LlmCodec, request: Json) -> Result<Json> {
     let request: CoreLlmRequest = serde_json::from_value(request)

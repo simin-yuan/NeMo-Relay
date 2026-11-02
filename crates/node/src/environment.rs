@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! State kept once per Node environment: cached callback factories, one promise settler,
-//! and the teardown flag.
-
 use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
@@ -44,6 +41,12 @@ pub(crate) enum Liveness {
     LetLoopExit,
 }
 
+impl Liveness {
+    const fn keeps_loop_alive(self) -> bool {
+        matches!(self, Self::KeepLoopAlive)
+    }
+}
+
 pub(crate) struct EnvState {
     teardown: Arc<AtomicBool>,
     pub(crate) factories: Factories,
@@ -71,8 +74,6 @@ pub(crate) fn state(env: &Env) -> napi::Result<Rc<EnvState>> {
         return Ok(state);
     }
     let state = Rc::new(EnvState::new(env)?);
-    // Runs before Node closes the settler. The hook is registered after the threadsafe
-    // function, and Node runs cleanup hooks last-in first-out.
     env.add_env_cleanup_hook(key, |key| {
         let removed = STATES.with(|slot| {
             let mut states = slot.borrow_mut();
@@ -161,8 +162,7 @@ impl Settlement {
             liveness,
         } = self;
         let settled = settle_deferred(env, deferred, outcome);
-        let released = if matches!(liveness, Liveness::KeepLoopAlive)
-            && pending.fetch_sub(1, Ordering::AcqRel) == 1
+        let released = if liveness.keeps_loop_alive() && pending.fetch_sub(1, Ordering::AcqRel) == 1
         {
             settler_liveness(env, &settler, false)
         } else {
@@ -208,12 +208,18 @@ pub(crate) struct PendingPromise {
 }
 
 impl PendingPromise {
-    pub(crate) fn resolve_with(mut self, settler: Settler) {
-        self.send(Ok(settler));
+    pub(crate) fn resolve_with(
+        mut self,
+        settler: impl FnOnce(&Env) -> napi::Result<JsArg> + Send + 'static,
+    ) {
+        self.send(Ok(Box::new(settler)));
     }
 
-    pub(crate) fn reject_with(mut self, settler: Settler) {
-        self.send(Err(settler));
+    pub(crate) fn reject_with(
+        mut self,
+        settler: impl FnOnce(&Env) -> napi::Result<JsArg> + Send + 'static,
+    ) {
+        self.send(Err(Box::new(settler)));
     }
 
     fn send(&mut self, outcome: std::result::Result<Settler, Settler>) {
@@ -262,9 +268,7 @@ pub(crate) fn create_promise<'env, V>(
         pending: Arc::clone(&state.pending),
         liveness,
     };
-    if matches!(liveness, Liveness::KeepLoopAlive)
-        && state.pending.fetch_add(1, Ordering::AcqRel) == 0
-    {
+    if liveness.keeps_loop_alive() && state.pending.fetch_add(1, Ordering::AcqRel) == 0 {
         settler_liveness(env, &state.settler, true)?;
     }
     Ok((pending, PromiseRaw::new(env.raw(), promise)))
@@ -285,7 +289,7 @@ where
     within_runtime_if_available(|| {
         tokio::spawn(async move {
             match future.await {
-                Ok(value) => pending.resolve_with(Box::new(move |env| resolve(env, value))),
+                Ok(value) => pending.resolve_with(move |env| resolve(env, value)),
                 Err(error) => pending.reject_with(error.settler()),
             }
         })
