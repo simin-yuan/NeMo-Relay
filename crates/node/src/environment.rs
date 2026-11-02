@@ -5,7 +5,6 @@
 //! and the teardown flag.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -51,23 +50,36 @@ pub(crate) struct EnvState {
 }
 
 thread_local! {
-    static STATES: RefCell<HashMap<usize, Rc<EnvState>>> = RefCell::new(HashMap::new());
+    static STATES: RefCell<Vec<(usize, Rc<EnvState>)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn env_key(env: &Env) -> usize {
-    env.raw() as usize
+    env.raw().addr()
 }
 
 pub(crate) fn state(env: &Env) -> napi::Result<Rc<EnvState>> {
     let key = env_key(env);
-    if let Some(state) = STATES.with(|slot| slot.borrow().get(&key).cloned()) {
+    let known = STATES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|(known, _)| *known == key)
+            .map(|(_, state)| Rc::clone(state))
+    });
+    if let Some(state) = known {
         return Ok(state);
     }
     let state = Rc::new(EnvState::new(env)?);
     // Runs before Node closes the settler. The hook is registered after the threadsafe
     // function, and Node runs cleanup hooks last-in first-out.
     env.add_env_cleanup_hook(key, |key| {
-        if let Some(state) = STATES.with(|slot| slot.borrow_mut().remove(&key)) {
+        let removed = STATES.with(|slot| {
+            let mut states = slot.borrow_mut();
+            states
+                .iter()
+                .position(|(known, _)| *known == key)
+                .map(|index| states.swap_remove(index).1)
+        });
+        if let Some(state) = removed {
             state.teardown.store(true, Ordering::Release);
             if let Err(error) = abort_tsfn(&state.settler) {
                 record_callback_error(format!(
@@ -76,9 +88,7 @@ pub(crate) fn state(env: &Env) -> napi::Result<Rc<EnvState>> {
             }
         }
     })?;
-    STATES.with(|slot| {
-        slot.borrow_mut().insert(key, Rc::clone(&state));
-    });
+    STATES.with(|slot| slot.borrow_mut().push((key, Rc::clone(&state))));
     Ok(state)
 }
 

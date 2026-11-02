@@ -4,83 +4,105 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { runInThisContext } from 'node:vm';
 
-const factories = eval(readFileSync(new URL('../src/callback_factories.js', import.meta.url), 'utf8'));
+const factoriesUrl = new URL('../src/callback_factories.js', import.meta.url);
+const factories = runInThisContext(readFileSync(factoriesUrl, 'utf8'), { filename: fileURLToPath(factoriesUrl) });
 
 function neverSettles() {
   return new Promise(() => {});
 }
 
-function invoke(wrapper, callId, { abort = false, streamResult = false } = {}) {
-  wrapper(null, abort, callId, { value: 1 }, false, undefined, false, undefined, undefined, streamResult);
+function abortedThen(signal, started) {
+  return new Promise((resolve) => {
+    signal.addEventListener('abort', resolve, { once: true });
+    started.resolve();
+  });
+}
+
+function invoke(wrapper, callId, { abort = false, streamResult = false, scope = undefined } = {}) {
+  wrapper(null, abort, callId, { value: 1 }, false, undefined, false, undefined, scope, streamResult);
+}
+
+function rejectSettle(name) {
+  return () => {
+    throw new Error(`${name} settled a cancelled callback`);
+  };
 }
 
 describe('promise callback cancellation', () => {
-  it('drops a non-stream callback that ignores cancellation and never settles', async () => {
-    let signal;
+  it('aborts a non-stream callback that never settles', async () => {
+    const started = Promise.withResolvers();
     const wrapper = factories.promise(
-      (_value, nextSignal) => {
-        signal = nextSignal;
+      (_value, signal) => {
+        started.resolve(signal);
         return neverSettles();
       },
-      () => {
-        throw new Error('cancelled callback settled');
-      },
-      () => {
-        throw new Error('cancelled callback rejected');
-      },
-      () => {},
-      () => {},
-      () => {},
+      rejectSettle('resolve'),
+      rejectSettle('reject'),
+      rejectSettle('streamPush'),
+      rejectSettle('streamEnd'),
+      rejectSettle('next'),
     );
 
     invoke(wrapper, 1);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(wrapper.pendingCalls(), 1);
+    const signal = await started.promise;
     assert.equal(signal.aborted, false);
 
     invoke(wrapper, 1, { abort: true });
     assert.equal(signal.aborted, true);
-    assert.equal(wrapper.pendingCalls(), 0);
-
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(wrapper.pendingCalls(), 0);
   });
 
-  it('does not register a non-stream callback cancelled before it starts', async () => {
-    let started = false;
+  it('keeps the callback scope until an aborted callback settles', async () => {
+    const scope = { marker: 'kept' };
+    const started = Promise.withResolvers();
+    const resolved = Promise.withResolvers();
     const wrapper = factories.promise(
-      () => {
-        started = true;
-        return neverSettles();
+      async (_value, signal) => {
+        await abortedThen(signal, started);
+        return factories.callbackScope();
       },
-      () => {},
-      () => {},
-      () => {},
-      () => {},
-      () => {},
+      (callId, value) => resolved.resolve([callId, value]),
+      rejectSettle('reject'),
+      rejectSettle('streamPush'),
+      rejectSettle('streamEnd'),
+      rejectSettle('next'),
     );
 
+    invoke(wrapper, 2, { scope });
+    await started.promise;
     invoke(wrapper, 2, { abort: true });
-    invoke(wrapper, 2);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(started, false);
-    assert.equal(wrapper.pendingCalls(), 0);
+    const [callId, value] = await resolved.promise;
+    assert.equal(callId, 2);
+    assert.equal(value.marker, 'kept');
   });
 
-  it('keeps a stream callback registered when cancellation starts', () => {
+  it('runs a cancelled stream callback through its cleanup', async () => {
+    const started = Promise.withResolvers();
+    const ended = Promise.withResolvers();
+    let cleanedUp = false;
     const wrapper = factories.promise(
-      neverSettles,
+      (_value, signal) => ({
+        async *[Symbol.asyncIterator]() {
+          try {
+            await abortedThen(signal, started);
+          } finally {
+            cleanedUp = true;
+          }
+        },
+      }),
       () => {},
-      () => {},
-      () => {},
-      () => {},
-      () => {},
+      rejectSettle('reject'),
+      rejectSettle('streamPush'),
+      (callId) => ended.resolve(callId),
+      rejectSettle('next'),
     );
 
     invoke(wrapper, 3, { streamResult: true });
-    assert.equal(wrapper.pendingCalls(), 1);
+    await started.promise;
     invoke(wrapper, 3, { abort: true, streamResult: true });
-    assert.equal(wrapper.pendingCalls(), 1);
+    assert.equal(await ended.promise, 3);
+    assert.equal(cleanedUp, true);
   });
 });

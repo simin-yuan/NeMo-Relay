@@ -1027,8 +1027,11 @@ is_true() {
 
 install_locked_napi_cross_toolchain() {
     local target="$1"
+    local toolchains="$NEMO_RELAY_REPO_ROOT/scripts/napi-cross"
     local host_arch=""
     local package=""
+    local package_json=""
+    local package_version=""
     local archive=""
     local version=""
     local cache=""
@@ -1046,23 +1049,31 @@ install_locked_napi_cross_toolchain() {
             exit 1
             ;;
     esac
-    if ! node -e "require.resolve('${package}/package.json')" >/dev/null 2>&1; then
-        echo "Error: ${package} is not installed. It must be an exact optional dependency so --use-napi-cross does not download an unlocked toolchain." >&2
+    npm ci --prefix "$toolchains" --ignore-scripts --no-audit --no-fund
+    package_json="$(node -p "require.resolve(process.argv[1] + '/package.json', { paths: [process.argv[2]] })" "$package" "$toolchains")"
+    package_version="$(node -p "require(process.argv[1]).version" "$package_json")"
+    version="$(node -p "require('@napi-rs/cross-toolchain/package.json').version")"
+    if [[ "$package_version" != "$version" ]]; then
+        echo "Error: ${package}@${package_version} in scripts/napi-cross does not match @napi-rs/cross-toolchain@${version} required by @napi-rs/cli; pin both to one version" >&2
         exit 1
     fi
-    version="$(node -p "require('@napi-rs/cross-toolchain/package.json').version")"
     cache="${HOME}/.napi-rs/cross-toolchain/${version}/${target}"
     if [[ -f "${cache}/package.json" ]]; then
         return 0
     fi
-    archive="$(node -p "require('${package}').toolchainPath")"
-    stage="$(mktemp -d)"
-    tar -xJf "$archive" -C "$stage"
+    archive="$(node -p "require(require.resolve(process.argv[1], { paths: [process.argv[2]] })).toolchainPath" "$package" "$toolchains")"
+    mkdir -p "$(dirname "$cache")"
+    stage="$(mktemp -d "$(dirname "$cache")/.${target}.XXXXXX")"
+    if ! tar -xJf "$archive" -C "$stage"; then
+        rm -rf "$stage"
+        echo "Error: failed to extract ${archive}" >&2
+        exit 1
+    fi
     if [[ ! -f "${stage}/package.json" ]]; then
+        rm -rf "$stage"
         echo "Error: ${package} did not contain a toolchain package.json" >&2
         exit 1
     fi
-    mkdir -p "$(dirname "$cache")"
     rm -rf "$cache"
     mv "$stage" "$cache"
 }

@@ -238,34 +238,29 @@
       }
       return failure;
     };
+    let publicationState = publicationContextId === undefined ? undefined : publicationStates.get(publicationContextId);
     let ownsPublicationState = false;
-    let publicationState;
-    if (publicationContextId !== undefined) {
-      publicationState = publicationStates.get(publicationContextId);
-      if (publicationState === undefined && publication) {
+    if (publicationState === undefined) {
+      if (publication) {
         publicationContextId = String(++nextPublicationContextId);
         publicationState = { active: true };
         publicationStates.set(publicationContextId, publicationState);
         ownsPublicationState = true;
-      } else if (publicationState === undefined) {
+      } else {
         publicationState = { active: false };
       }
-    } else if (publication) {
-      publicationContextId = String(++nextPublicationContextId);
-      publicationState = { active: true };
-      publicationStates.set(publicationContextId, publicationState);
-      ownsPublicationState = true;
-    } else {
-      publicationState = { active: false };
     }
     const token = callbackStore(publicationState, publicationContextId, scope);
-    const settlePublication = () => {
+    const releaseCall = () => {
       if (ownsPublicationState) {
         publicationState.active = false;
         publicationStates.delete(publicationContextId);
       }
-      expireCallbackStore(token);
       controllers.delete(callId);
+    };
+    const settlePublication = () => {
+      releaseCall();
+      expireCallbackStore(token);
     };
     controller.signal.addEventListener(
       'abort',
@@ -274,7 +269,7 @@
           closeDownstream(downstream).catch(() => {});
         }
         if (!streamResult) {
-          settlePublication();
+          releaseCall();
         }
       },
       { once: true },
@@ -507,8 +502,7 @@
     promise(fn, resolve, reject, streamPush, streamEnd, next) {
       const settle = { resolve, reject, streamPush, streamEnd, next };
       const controllers = new Map();
-      const cancelled = new Set();
-      const wrapper = function __nemo_relay_promise_wrapper(
+      return function __nemo_relay_promise_wrapper(
         error,
         abort,
         callId,
@@ -525,16 +519,7 @@
           return;
         }
         if (abort) {
-          const controller = controllers.get(callId);
-          if (controller === undefined) {
-            cancelled.add(callId);
-            return;
-          }
-          controller.abort();
-          return;
-        }
-        const alreadyCancelled = cancelled.delete(callId);
-        if (alreadyCancelled && !streamResult) {
+          controllers.get(callId)?.abort();
           return;
         }
         callPromise(
@@ -550,12 +535,7 @@
           scope,
           streamResult,
         );
-        if (alreadyCancelled) {
-          controllers.get(callId)?.abort();
-        }
       };
-      wrapper.pendingCalls = () => controllers.size;
-      return wrapper;
     },
 
     scoped(fn) {

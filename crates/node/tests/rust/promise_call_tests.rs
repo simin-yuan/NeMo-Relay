@@ -4,22 +4,19 @@
 use super::*;
 use nemo_relay::api::runtime::current_scope_stack;
 
-#[test]
-fn execution_next_context_restores_scope() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        let scope_stack = nemo_relay::api::runtime::create_scope_stack();
-        let context = nemo_relay::api::runtime::with_scope_stack(scope_stack.clone(), || {
-            MiddlewareContinuationContext::capture()
-        });
-
-        let observed =
-            tokio::spawn(async move { context.run(async move { current_scope_stack() }).await })
-                .await
-                .unwrap();
-
-        assert!(Arc::ptr_eq(&observed, &scope_stack));
+#[tokio::test]
+async fn execution_next_context_restores_scope() {
+    let scope_stack = nemo_relay::api::runtime::create_scope_stack();
+    let context = nemo_relay::api::runtime::with_scope_stack(scope_stack.clone(), || {
+        MiddlewareContinuationContext::capture()
     });
+
+    let observed =
+        tokio::spawn(async move { context.run(async move { current_scope_stack() }).await })
+            .await
+            .unwrap();
+
+    assert!(Arc::ptr_eq(&observed, &scope_stack));
 }
 
 fn json_completion() -> (
@@ -48,20 +45,10 @@ fn cancel_drops_a_json_call_that_never_settles() {
     let registry = CallRegistry::default();
     let call_id = registry.allocate();
     let (completion, receiver) = json_completion();
-    assert!(registry.insert(call_id, completion));
+    registry.insert(call_id, completion);
     registry.cancel(call_id);
     registry.resolve(call_id, || Ok(Json::Null));
     assert!(registry.stream(call_id).is_none());
-    assert_sender_dropped(receiver);
-}
-
-#[test]
-fn cancel_before_insert_drops_a_json_call() {
-    let registry = CallRegistry::default();
-    let call_id = registry.allocate();
-    registry.cancel(call_id);
-    let (completion, receiver) = json_completion();
-    assert!(!registry.insert(call_id, completion));
     assert_sender_dropped(receiver);
 }
 
@@ -80,7 +67,7 @@ fn cancel_keeps_a_stream_call() {
         finished: Arc::default(),
         parked: Mutex::new(None),
     }));
-    assert!(registry.insert(call_id, completion));
+    registry.insert(call_id, completion);
     registry.cancel(call_id);
     assert!(registry.stream(call_id).is_some());
 }

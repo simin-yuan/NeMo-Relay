@@ -6,12 +6,11 @@
 //! This module wraps JS middleware callbacks so Rust can call them from any thread
 //! and await either synchronous return values or Promise-returning callbacks.
 
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::task::{Context, Poll};
 
 use napi::Env;
@@ -64,6 +63,10 @@ pub(crate) fn publication_callback_context_id() -> Option<String> {
     PUBLICATION_CALLBACK_CONTEXT_ID
         .try_with(Clone::clone)
         .unwrap_or(None)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub type JsonNextFn =
@@ -185,23 +188,25 @@ struct StreamCompletion {
 
 impl StreamCompletion {
     fn ready(&self) {
-        if let Some(ready) = self.ready.lock().unwrap().take() {
+        let ready = lock(&self.ready).take();
+        if let Some(ready) = ready {
             let _ = ready.send(Ok(()));
         }
     }
 
     fn finish(&self, result: FlowResult<()>) {
         self.finished.store(true, Ordering::Release);
-        self.chunks.lock().unwrap().take();
+        lock(&self.chunks).take();
         self.closed.send_replace(Some(result));
     }
 
     fn fail(&self, error: FlowError) {
-        match self.ready.lock().unwrap().take() {
+        let ready = lock(&self.ready).take();
+        match ready {
             Some(ready) => {
                 let _ = ready.send(Err(error.clone()));
             }
-            None => *self.terminal_error.lock().unwrap() = Some(error.clone()),
+            None => *lock(&self.terminal_error) = Some(error.clone()),
         }
         self.finish(Err(error));
     }
@@ -213,19 +218,6 @@ enum CallCompletion {
 }
 
 impl CallCompletion {
-    fn resolve(self, value: impl FnOnce() -> FlowResult<Json>) -> Option<Self> {
-        match self {
-            Self::Json(completion) => {
-                completion.settle(value());
-                None
-            }
-            Self::Stream(stream) => {
-                stream.ready();
-                Some(Self::Stream(stream))
-            }
-        }
-    }
-
     fn fail(self, error: FlowError) {
         match self {
             Self::Json(completion) => completion.settle(Err(error)),
@@ -235,15 +227,10 @@ impl CallCompletion {
 }
 
 #[derive(Default)]
-struct CallRegistryState {
-    calls: HashMap<u64, CallCompletion>,
-    cancelled: HashSet<u64>,
-}
-
-#[derive(Default)]
 struct CallRegistry {
     next_id: AtomicU64,
-    state: Mutex<CallRegistryState>,
+    json: Mutex<HashMap<u64, JsonCompletion>>,
+    streams: Mutex<HashMap<u64, Arc<StreamCompletion>>>,
 }
 
 impl CallRegistry {
@@ -251,59 +238,54 @@ impl CallRegistry {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn insert(&self, call_id: u64, completion: CallCompletion) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let cancelled = state.cancelled.remove(&call_id);
-        if cancelled && matches!(completion, CallCompletion::Json(_)) {
-            return false;
+    fn insert(&self, call_id: u64, completion: CallCompletion) {
+        match completion {
+            CallCompletion::Json(completion) => {
+                lock(&self.json).insert(call_id, completion);
+            }
+            CallCompletion::Stream(stream) => {
+                lock(&self.streams).insert(call_id, stream);
+            }
         }
-        state.calls.insert(call_id, completion);
-        true
     }
 
     fn resolve(&self, call_id: u64, value: impl FnOnce() -> FlowResult<Json>) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(completion) = state.calls.remove(&call_id)
-            && let Some(kept) = completion.resolve(value)
-        {
-            state.calls.insert(call_id, kept);
+        let json = lock(&self.json).remove(&call_id);
+        if let Some(completion) = json {
+            completion.settle(value());
+            return;
+        }
+        let stream = self.stream(call_id);
+        if let Some(stream) = stream {
+            stream.ready();
         }
     }
 
     fn fail(&self, call_id: u64, error: FlowError) {
-        if let Some(completion) = self.state.lock().unwrap().calls.remove(&call_id) {
-            completion.fail(error);
+        let json = lock(&self.json).remove(&call_id);
+        if let Some(completion) = json {
+            completion.settle(Err(error));
+            return;
+        }
+        let stream = lock(&self.streams).remove(&call_id);
+        if let Some(stream) = stream {
+            stream.fail(error);
         }
     }
 
     fn stream(&self, call_id: u64) -> Option<Arc<StreamCompletion>> {
-        match self.state.lock().unwrap().calls.get(&call_id) {
-            Some(CallCompletion::Stream(stream)) => Some(Arc::clone(stream)),
-            Some(CallCompletion::Json(_)) | None => None,
-        }
+        lock(&self.streams).get(&call_id).cloned()
     }
 
     fn end_stream(&self, call_id: u64) {
-        let mut state = self.state.lock().unwrap();
-        if let Entry::Occupied(entry) = state.calls.entry(call_id)
-            && let CallCompletion::Stream(stream) = entry.get()
-        {
+        let stream = lock(&self.streams).remove(&call_id);
+        if let Some(stream) = stream {
             stream.finish(Ok(()));
-            entry.remove();
         }
     }
 
     fn cancel(&self, call_id: u64) {
-        let mut state = self.state.lock().unwrap();
-        match state.calls.entry(call_id) {
-            Entry::Occupied(entry) if matches!(entry.get(), CallCompletion::Json(_)) => {
-                entry.remove();
-            }
-            Entry::Occupied(_) => {}
-            Entry::Vacant(_) => {
-                state.cancelled.insert(call_id);
-            }
-        }
+        lock(&self.json).remove(&call_id);
     }
 }
 
@@ -371,7 +353,7 @@ struct StreamCancellationState {
 
 impl StreamCancellation {
     fn attach(&self, call: &CallCancellation) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         if state.requested {
             drop(state);
             call.cancel();
@@ -381,7 +363,7 @@ impl StreamCancellation {
     }
 
     pub(crate) fn cancel(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         state.requested = true;
         for call in &state.calls {
             call.cancel();
@@ -401,14 +383,7 @@ impl Stream for JsCallbackStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.receiver).poll_next(cx) {
-            Poll::Ready(None) => Poll::Ready(
-                self.completion
-                    .terminal_error
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .map(Err),
-            ),
+            Poll::Ready(None) => Poll::Ready(lock(&self.completion.terminal_error).take().map(Err)),
             poll => poll,
         }
     }
@@ -434,7 +409,7 @@ impl LlmStreamInner for JsCallbackStream {
                 .map_err(|_| FlowError::Internal("JavaScript stream cleanup ended early".into()))?
                 .as_ref()
                 .is_some_and(|result| result.is_ok());
-            let parked = completion.parked.lock().unwrap().take();
+            let parked = lock(&completion.parked).take();
             if let Some(parked) = parked {
                 let _ = parked.await;
             }
@@ -442,10 +417,7 @@ impl LlmStreamInner for JsCallbackStream {
                 return Ok(());
             }
             // `None` means `poll_next` already delivered the error through `next()`.
-            match completion.terminal_error.lock().unwrap().take() {
-                Some(error) => Err(error),
-                None => Ok(()),
-            }
+            lock(&completion.terminal_error).take().map_or(Ok(()), Err)
         })
     }
 }
@@ -531,7 +503,8 @@ fn push_stream_chunk(env: &Env, calls: &CallRegistry, call_id: u64, chunk: Json)
     let Some(stream) = calls.stream(call_id) else {
         return Ok(js_value(env, ())?);
     };
-    let Some(chunks) = stream.chunks.lock().unwrap().as_ref().cloned() else {
+    let chunks = lock(&stream.chunks).clone();
+    let Some(chunks) = chunks else {
         return Ok(js_value(env, ())?);
     };
     match chunks.try_send(Ok(chunk)) {
@@ -544,7 +517,7 @@ fn push_stream_chunk(env: &Env, calls: &CallRegistry, call_id: u64, chunk: Json)
                     pending.resolve_with(Box::new(|env| js_value(env, ())));
                 })
             });
-            *stream.parked.lock().unwrap() = Some(task);
+            *lock(&stream.parked) = Some(task);
             Ok(detach(env, &promise))
         }
     }
@@ -555,7 +528,7 @@ fn continue_call(ctx: FunctionCallContext) -> Result<JsArg> {
     // SAFETY: the argument belongs to this call, and the external was created by
     // `build_invoke_args` in this environment.
     let state = unsafe { External::<NextState>::from_napi_ref(ctx.env.raw(), state.raw()) }?;
-    let arg = ctx.get::<Json>(1).unwrap_or(Json::Null);
+    let arg = ctx.get::<Json>(1)?;
     let scope = callback_factory::callback_scope_from(ctx.env, ctx.get::<Unknown>(2)?)?;
     let continuation = match &scope {
         Some(scope) => state
@@ -635,14 +608,8 @@ fn build_promise_args(
             let call_id = invoke.call_id;
             match build_invoke_args(env, invoke, undefined) {
                 Ok(args) => {
-                    if calls.insert(call_id, completion) {
-                        Ok(args)
-                    } else {
-                        Err(napi::Error::new(
-                            napi::Status::Cancelled,
-                            "JavaScript callback was cancelled before it started",
-                        ))
-                    }
+                    calls.insert(call_id, completion);
+                    Ok(args)
                 }
                 Err(error) => {
                     completion.fail(FlowError::Internal(format!(
@@ -684,7 +651,7 @@ fn build_invoke_args(env: &Env, call: InvokeArgs, undefined: JsArg) -> napi::Res
 /// A wrapper around a JS function that can be called from any thread and
 /// transparently handles both synchronous and Promise return values.
 pub struct PromiseAwareFn {
-    tsfn: Mutex<Option<Arc<PromiseTsfn>>>,
+    tsfn: RwLock<Option<Arc<PromiseTsfn>>>,
     calls: Arc<CallRegistry>,
 }
 
@@ -707,7 +674,7 @@ impl PromiseAwareFn {
                 build_promise_args(ctx, &registry)
             })?;
         Ok(Self {
-            tsfn: Mutex::new(Some(Arc::new(tsfn))),
+            tsfn: RwLock::new(Some(Arc::new(tsfn))),
             calls,
         })
     }
@@ -822,10 +789,9 @@ impl PromiseAwareFn {
 
     fn tsfn(&self) -> FlowResult<Arc<PromiseTsfn>> {
         self.tsfn
-            .lock()
-            .unwrap()
-            .as_ref()
-            .cloned()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
             .ok_or_else(closed_tsfn_error)
     }
 
@@ -858,12 +824,6 @@ impl PromiseAwareFn {
             finished: Arc::default(),
             parked: Mutex::new(None),
         });
-        let cancellation =
-            CallCancellation::new(call_id, tsfn.clone(), Arc::clone(&completion.finished));
-        if let Some(stream_cancellation) = stream_cancellation {
-            stream_cancellation.attach(&cancellation);
-        }
-        let mut cancellation_guard = CallCancellationGuard::new(cancellation.clone());
         let next = self.next_state(next.map(NextFn::Stream));
         let status = tsfn.call(
             Ok(PromiseCall::Invoke(Box::new(CallArgs {
@@ -882,6 +842,12 @@ impl PromiseAwareFn {
             ThreadsafeFunctionCallMode::NonBlocking,
         );
         queue_status_result(status)?;
+        let cancellation =
+            CallCancellation::new(call_id, tsfn.clone(), Arc::clone(&completion.finished));
+        if let Some(stream_cancellation) = stream_cancellation {
+            stream_cancellation.attach(&cancellation);
+        }
+        let mut cancellation_guard = CallCancellationGuard::new(cancellation.clone());
         ready_receiver
             .await
             .map_err(|e| FlowError::Internal(e.to_string()))??;
@@ -898,7 +864,12 @@ impl PromiseAwareFn {
 
     /// Release the underlying threadsafe function so it does not outlive its registration.
     pub fn close(&self) -> napi::Result<()> {
-        match self.tsfn.lock().unwrap().take() {
+        let tsfn = self
+            .tsfn
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match tsfn {
             Some(tsfn) => abort_tsfn(&tsfn),
             None => Ok(()),
         }
@@ -914,11 +885,6 @@ impl PromiseAwareFn {
         let call_id = self.calls.allocate();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let finished = Arc::new(AtomicBool::new(false));
-        let mut cancellation_guard = CallCancellationGuard::new(CallCancellation::new(
-            call_id,
-            tsfn.clone(),
-            Arc::clone(&finished),
-        ));
         let next = self.next_state(next);
         let status = tsfn.call(
             Ok(PromiseCall::Invoke(Box::new(CallArgs {
@@ -934,11 +900,16 @@ impl PromiseAwareFn {
                     scope: CallbackScope::capture(),
                     stream_result: false,
                 },
-                completion: CallCompletion::Json(JsonCompletion { sender, finished }),
+                completion: CallCompletion::Json(JsonCompletion {
+                    sender,
+                    finished: Arc::clone(&finished),
+                }),
             }))),
             ThreadsafeFunctionCallMode::NonBlocking,
         );
         queue_status_result(status)?;
+        let mut cancellation_guard =
+            CallCancellationGuard::new(CallCancellation::new(call_id, tsfn.clone(), finished));
 
         let result = receiver
             .await
