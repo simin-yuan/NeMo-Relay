@@ -22,7 +22,7 @@ use napi::bindgen_prelude::{
 use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMode};
 use napi::{Env, ValueType};
 use napi_derive::napi;
-use nemo_relay::api::runtime::{
+use nemo_relay_runtime::api::runtime::{
     EventMetadataInjectorFn, EventSanitizeFn, EventSubscriberFn, LlmCodecIdentity, LlmCollector,
     LlmConditionalFn, LlmExecutionContext, LlmExecutionFn, LlmExecutionNextFn, LlmFinalizer,
     LlmRequestInterceptFn, LlmSanitizeRequestContext, LlmSanitizeRequestFn,
@@ -34,17 +34,17 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-use nemo_relay::api::event::{
+use nemo_relay_runtime::api::event::{
     CategoryProfile, DataSchema, Event, EventCategory,
     EventSanitizeFields as CoreEventSanitizeFields, LogSeverity, PendingMarkSpec,
 };
-use nemo_relay::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
-use nemo_relay::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
-use nemo_relay::codec::optimization::LlmOptimizationContribution;
-use nemo_relay::codec::request::AnnotatedLlmRequest;
-use nemo_relay::codec::response::AnnotatedLlmResponse;
-use nemo_relay::codec::traits::{LlmCodec, LlmResponseCodec};
-use nemo_relay::error::{FlowError, Result};
+use nemo_relay_runtime::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
+use nemo_relay_runtime::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
+use nemo_relay_types::codec::optimization::LlmOptimizationContribution;
+use nemo_relay_types::codec::request::AnnotatedLlmRequest;
+use nemo_relay_types::codec::response::AnnotatedLlmResponse;
+use nemo_relay_types::codec::traits::{LlmCodec, LlmResponseCodec};
+use nemo_relay_types::error::{FlowError, Result};
 
 use crate::callback_factory;
 use crate::convert::{
@@ -285,7 +285,8 @@ pub fn wrap_js_tool_sanitize_promise_fn(
     let func = Arc::new(PromiseAwareFn::new(env, func)?);
     Ok(Arc::new(move |name: String, value: Json| {
         let func = func.clone();
-        let publication = nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
+        let publication =
+            nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
         Box::pin(async move {
             let args = vec![Json::String(name), value];
             let result = if publication {
@@ -310,7 +311,7 @@ pub fn wrap_js_llm_sanitize_request_promise_fn(
         move |request: LlmRequest, context: LlmSanitizeRequestContext| {
             let func = func.clone();
             let publication =
-                nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
+                nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
             Box::pin(async move {
                 let request = serde_json::to_value(request).map_err(|error| {
                     let error = FlowError::Internal(format!(
@@ -363,7 +364,7 @@ pub fn wrap_js_llm_sanitize_response_promise_fn(
         move |response: Json, context: LlmSanitizeResponseContext| {
             let func = func.clone();
             let publication =
-                nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
+                nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
             Box::pin(async move {
                 let context = js_llm_sanitize_response_context(&context);
                 let build_args: crate::promise_call::Arg0Builder = Box::new(move |env| {
@@ -533,7 +534,8 @@ pub fn wrap_js_event_sanitize_promise_fn(
                     })?,
                 ];
                 let publication =
-                    nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
+                    nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback(
+                    );
                 let value = if publication {
                     func.call_spread_for_publication(args).await
                 } else {
@@ -591,7 +593,7 @@ pub fn wrap_js_event_metadata_injector_promise_fn(
                     error
                 })?;
             let publication =
-                nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
+                nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
             let value = if publication {
                 func.call_spread_for_publication(vec![event_json]).await
             } else {
@@ -1327,7 +1329,7 @@ pub(crate) fn wrap_js_response_codec(
 pub fn wrap_js_tool_exec_intercept_fn(
     env: &Env,
     func: &Function<JsArg, JsArg>,
-) -> napi::Result<nemo_relay::api::runtime::ToolExecutionFn> {
+) -> napi::Result<nemo_relay_runtime::api::runtime::ToolExecutionFn> {
     let func = Arc::new(PromiseAwareFn::new(env, func)?);
     Ok(Arc::new(
         move |context: ToolExecutionContext, next: ToolExecutionNextFn| {

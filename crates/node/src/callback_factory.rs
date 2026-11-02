@@ -8,10 +8,10 @@ use napi::bindgen_prelude::{
     JsValuesTupleIntoVec, Object, Unknown,
 };
 use napi::{Env, ValueType};
-use nemo_relay::api::runtime::subscriber_dispatcher::{
+use nemo_relay_runtime::api::runtime::subscriber_dispatcher::{
     PublicationBuffer, capture_nested_publication_buffer,
 };
-use nemo_relay::api::runtime::{
+use nemo_relay_runtime::api::runtime::{
     PropagationContext, ScopeStackHandle, capture_propagation_context, current_scope_stack,
 };
 

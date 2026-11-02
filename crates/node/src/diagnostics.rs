@@ -8,7 +8,7 @@ use napi_derive::napi;
 
 use crate::convert::{JAVASCRIPT_MAX_SAFE_INTEGER, js_value};
 use crate::error::{Error, Result};
-use nemo_relay::diagnostics::embedded::{self, EmbeddedDiagnosticsReader};
+use nemo_relay_diagnostics::embedded::{self, EmbeddedDiagnosticsReader};
 use serde_json::Value as Json;
 
 fn bounded_query(query: Option<JsString>) -> Result<String> {

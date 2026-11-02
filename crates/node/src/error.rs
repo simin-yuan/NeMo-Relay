@@ -3,14 +3,14 @@
 
 use napi::bindgen_prelude::{JsError, ToNapiValue};
 use napi::{Env, Status, check_status};
-use nemo_relay::diagnostics::embedded::EmbeddedDiagnosticError;
-use nemo_relay::error::FlowError;
-use nemo_relay::observability::atof::AtofExporterError;
-use nemo_relay::observability::otel::OpenTelemetryError;
-use nemo_relay::observability::otel_file::OtlpFileExporterError;
-use nemo_relay::plugin::PluginError;
 use nemo_relay_adaptive::AdaptiveError;
 use nemo_relay_adaptive::acg::AcgError;
+use nemo_relay_diagnostics::embedded::EmbeddedDiagnosticError;
+use nemo_relay_observability::atof::AtofExporterError;
+use nemo_relay_observability::otel::OpenTelemetryError;
+use nemo_relay_observability::otel_file::OtlpFileExporterError;
+use nemo_relay_plugin_host::PluginError;
+use nemo_relay_types::error::FlowError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

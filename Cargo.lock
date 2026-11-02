@@ -925,7 +925,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1921,61 +1921,19 @@ dependencies = [
 name = "nemo-relay"
 version = "1.0.0"
 dependencies = [
- "arrayvec",
- "async-trait",
- "base64",
- "bitflags",
- "chrono",
- "circular-buffer",
- "enumset",
- "futures",
- "futures-util",
- "http",
- "http-body",
- "hyper-util",
- "jsonschema",
- "libloading 0.8.9",
- "log",
+ "nemo-relay-builtins",
+ "nemo-relay-diagnostics",
+ "nemo-relay-logging",
+ "nemo-relay-observability",
  "nemo-relay-plugin",
+ "nemo-relay-plugin-host",
+ "nemo-relay-resource-metrics",
+ "nemo-relay-runtime",
  "nemo-relay-types",
- "nemo-relay-worker-proto",
- "object_store",
- "opentelemetry",
- "opentelemetry-http",
- "opentelemetry-otlp",
- "opentelemetry-proto",
- "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
- "percent-encoding",
- "prost",
- "rcgen",
- "reqwest",
- "ring",
- "rustix",
- "rustls",
- "schemars",
- "semver",
- "serde",
  "serde_json",
- "sha2",
- "shell-words",
- "spdlog-rs",
- "strum",
- "sysinfo",
  "tempfile",
- "thiserror",
  "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-tungstenite",
- "toml",
- "tonic",
- "tower",
- "tracing",
- "typed-builder",
- "unicode-general-category",
- "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1984,7 +1942,12 @@ version = "1.0.0"
 dependencies = [
  "chrono",
  "log",
- "nemo-relay",
+ "nemo-relay-codecs",
+ "nemo-relay-logging",
+ "nemo-relay-model-pricing",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
+ "nemo-relay-types",
  "redis",
  "regex",
  "serde",
@@ -1997,6 +1960,21 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "uuid",
+]
+
+[[package]]
+name = "nemo-relay-builtins"
+version = "1.0.0"
+dependencies = [
+ "nemo-relay-adaptive",
+ "nemo-relay-diagnostics",
+ "nemo-relay-observability",
+ "nemo-relay-pii-redaction",
+ "nemo-relay-plugin",
+ "nemo-relay-plugin-host",
+ "nemo-relay-types",
+ "opentelemetry_sdk",
+ "serde_json",
 ]
 
 [[package]]
@@ -2024,9 +2002,17 @@ dependencies = [
  "libc",
  "listeners",
  "log",
- "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-builtins",
+ "nemo-relay-codecs",
+ "nemo-relay-diagnostics",
+ "nemo-relay-logging",
+ "nemo-relay-model-pricing",
+ "nemo-relay-observability",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
+ "nemo-relay-resource-metrics",
+ "nemo-relay-runtime",
  "nemo-relay-types",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -2063,6 +2049,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-codecs"
+version = "1.0.0"
+dependencies = [
+ "futures",
+ "futures-util",
+ "log",
+ "nemo-relay-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "nemo-relay-daemon-transport-benchmark"
 version = "1.0.0"
 dependencies = [
@@ -2090,15 +2090,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-diagnostics"
+version = "1.0.0"
+dependencies = [
+ "arrayvec",
+ "chrono",
+ "circular-buffer",
+ "enumset",
+ "log",
+ "nemo-relay-plugin",
+ "nemo-relay-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "nemo-relay-ffi"
 version = "1.0.0"
 dependencies = [
  "cbindgen",
  "chrono",
  "libc",
- "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-builtins",
+ "nemo-relay-codecs",
+ "nemo-relay-diagnostics",
+ "nemo-relay-logging",
+ "nemo-relay-observability",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
+ "nemo-relay-types",
  "serde",
  "serde_json",
  "sha2",
@@ -2113,10 +2138,48 @@ name = "nemo-relay-language-binding-plugin-example"
 version = "1.0.0"
 dependencies = [
  "futures",
- "nemo-relay",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
+ "nemo-relay-types",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "nemo-relay-logging"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "log",
+ "nemo-relay-diagnostics",
+ "nemo-relay-plugin",
+ "nemo-relay-types",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "spdlog-rs",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nemo-relay-model-pricing"
+version = "1.0.0"
+dependencies = [
+ "log",
+ "nemo-relay-plugin",
+ "nemo-relay-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -2128,9 +2191,16 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-builtins",
+ "nemo-relay-codecs",
+ "nemo-relay-diagnostics",
+ "nemo-relay-logging",
+ "nemo-relay-observability",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
+ "nemo-relay-types",
  "serde",
  "serde_json",
  "stacker",
@@ -2141,12 +2211,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-observability"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "futures-util",
+ "http",
+ "log",
+ "nemo-relay-codecs",
+ "nemo-relay-logging",
+ "nemo-relay-model-pricing",
+ "nemo-relay-plugin",
+ "nemo-relay-types",
+ "object_store",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry-proto",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "prost",
+ "rcgen",
+ "reqwest",
+ "rustix",
+ "rustls",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "toml",
+ "tonic",
+ "typed-builder",
+ "unicode-general-category",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "nemo-relay-pii-redaction"
 version = "1.0.0"
 dependencies = [
  "futures",
  "log",
- "nemo-relay",
+ "nemo-relay-codecs",
+ "nemo-relay-diagnostics",
+ "nemo-relay-logging",
+ "nemo-relay-observability",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
+ "nemo-relay-types",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -2166,8 +2288,10 @@ version = "1.0.0"
 dependencies = [
  "futures",
  "nemo-relay-types",
+ "schemars",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]
@@ -2183,14 +2307,78 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-plugin-host"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body",
+ "hyper-util",
+ "jsonschema",
+ "libloading 0.8.9",
+ "log",
+ "nemo-relay-codecs",
+ "nemo-relay-diagnostics",
+ "nemo-relay-logging",
+ "nemo-relay-model-pricing",
+ "nemo-relay-observability",
+ "nemo-relay-plugin",
+ "nemo-relay-resource-metrics",
+ "nemo-relay-runtime",
+ "nemo-relay-types",
+ "nemo-relay-worker-proto",
+ "object_store",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry-proto",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "prost",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rustix",
+ "rustls",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "strum",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "toml",
+ "tonic",
+ "tower",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "nemo-relay-python"
 version = "1.0.0"
 dependencies = [
  "chrono",
  "libc",
- "nemo-relay",
  "nemo-relay-adaptive",
+ "nemo-relay-builtins",
+ "nemo-relay-codecs",
+ "nemo-relay-diagnostics",
+ "nemo-relay-logging",
+ "nemo-relay-observability",
  "nemo-relay-pii-redaction",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
+ "nemo-relay-types",
  "pyo3",
  "pyo3-async-runtimes",
  "pythonize",
@@ -2203,11 +2391,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemo-relay-resource-metrics"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "libloading 0.8.9",
+ "log",
+ "nemo-relay-diagnostics",
+ "nemo-relay-plugin",
+ "nemo-relay-types",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nemo-relay-runtime"
+version = "1.0.0"
+dependencies = [
+ "bitflags",
+ "chrono",
+ "futures",
+ "futures-util",
+ "log",
+ "nemo-relay-codecs",
+ "nemo-relay-diagnostics",
+ "nemo-relay-model-pricing",
+ "nemo-relay-resource-metrics",
+ "nemo-relay-types",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "strum",
+ "tokio",
+ "tokio-stream",
+ "typed-builder",
+ "uuid",
+]
+
+[[package]]
 name = "nemo-relay-rust-grpc-worker-plugin-example"
 version = "1.0.0"
 dependencies = [
  "futures-util",
- "nemo-relay",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
  "nemo-relay-worker",
  "serde",
  "serde_json",
@@ -2223,8 +2458,9 @@ name = "nemo-relay-rust-native-plugin-example"
 version = "1.0.0"
 dependencies = [
  "futures",
- "nemo-relay",
  "nemo-relay-plugin",
+ "nemo-relay-plugin-host",
+ "nemo-relay-runtime",
  "serde",
  "serde_json",
  "sha2",
@@ -2240,11 +2476,14 @@ dependencies = [
  "bitflags",
  "chrono",
  "enumset",
+ "opentelemetry",
  "regex",
  "schemars",
  "serde",
  "serde_json",
  "strum",
+ "thiserror",
+ "tokio-stream",
  "typed-builder",
  "uuid",
 ]
@@ -3333,7 +3572,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3392,7 +3631,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4009,7 +4248,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4773,7 +5012,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

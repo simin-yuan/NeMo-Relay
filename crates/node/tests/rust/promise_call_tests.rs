@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use nemo_relay::api::runtime::current_scope_stack;
+use nemo_relay_runtime::api::runtime::current_scope_stack;
 
 #[tokio::test]
 async fn execution_next_context_restores_scope() {
-    let scope_stack = nemo_relay::api::runtime::create_scope_stack();
-    let context = nemo_relay::api::runtime::with_scope_stack(scope_stack.clone(), || {
+    let scope_stack = nemo_relay_runtime::api::runtime::create_scope_stack();
+    let context = nemo_relay_runtime::api::runtime::with_scope_stack(scope_stack.clone(), || {
         MiddlewareContinuationContext::capture()
     });
 

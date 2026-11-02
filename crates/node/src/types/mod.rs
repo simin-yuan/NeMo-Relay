@@ -9,28 +9,31 @@
 
 mod resource_metrics;
 
+use std::sync::Arc;
+
 use napi::Env;
 use napi::bindgen_prelude::Unknown;
 use napi_derive::napi;
 
 use crate::error::{Error, Result};
-use nemo_relay::api::runtime::subscriber_dispatcher::PublicationBuffer;
-use nemo_relay::api::runtime::{ScopeStackHandle, create_scope_stack};
+use nemo_relay_runtime::api::runtime::subscriber_dispatcher::PublicationBuffer;
+use nemo_relay_runtime::api::runtime::{ScopeStackHandle, create_scope_stack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-use nemo_relay::api::event::{
+use nemo_relay_codecs::resolve::ProviderSurface;
+use nemo_relay_runtime::api::event::{
     DataSchema as CoreDataSchema, Event, LogSeverity as CoreLogSeverity,
     MetricKind as CoreMetricKind, MetricMeasurement as CoreMetricMeasurement,
     MetricValueType as CoreMetricValueType,
 };
-use nemo_relay::api::llm::{LlmHandle as CoreLlmHandle, LlmRequest as CoreLlmRequest};
-use nemo_relay::api::scope::{ScopeHandle as CoreScopeHandle, ScopeType as CoreScopeType};
-use nemo_relay::api::tool::{
+use nemo_relay_runtime::api::llm::{LlmHandle as CoreLlmHandle, LlmRequest as CoreLlmRequest};
+use nemo_relay_runtime::api::scope::{ScopeHandle as CoreScopeHandle, ScopeType as CoreScopeType};
+use nemo_relay_runtime::api::tool::{
     ToolExecutionResult as CoreToolExecutionResult, ToolHandle as CoreToolHandle,
 };
-use nemo_relay::codec::request::AnnotatedLlmRequest;
-use nemo_relay::codec::traits::{LlmCodec, LlmResponseCodec};
+use nemo_relay_types::codec::request::AnnotatedLlmRequest;
+use nemo_relay_types::codec::traits::{LlmCodec, LlmResponseCodec};
 
 /// Identity of one visible Relay scope.
 #[napi(object)]
@@ -48,8 +51,8 @@ pub struct ScopeStackSnapshot {
     pub scopes: Vec<ScopeStackEntry>,
 }
 
-impl From<nemo_relay::api::runtime::ScopeStackSnapshot> for ScopeStackSnapshot {
-    fn from(snapshot: nemo_relay::api::runtime::ScopeStackSnapshot) -> Self {
+impl From<nemo_relay_runtime::api::runtime::ScopeStackSnapshot> for ScopeStackSnapshot {
+    fn from(snapshot: nemo_relay_runtime::api::runtime::ScopeStackSnapshot) -> Self {
         Self {
             scopes: snapshot
                 .scopes
@@ -188,7 +191,7 @@ pub enum MetricTemporality {
     LowMemory,
 }
 
-impl From<MetricTemporality> for nemo_relay::observability::otel_metrics::MetricTemporality {
+impl From<MetricTemporality> for nemo_relay_observability::otel_metrics::MetricTemporality {
     fn from(value: MetricTemporality) -> Self {
         match value {
             MetricTemporality::Cumulative => Self::Cumulative,
@@ -606,7 +609,8 @@ fn decode_response(codec: &dyn LlmResponseCodec, response: &Json) -> Result<Json
 /// (decodeResponse). Construct with `new OpenAIChatCodec()`.
 #[napi(js_name = "OpenAIChatCodec")]
 pub struct OpenAIChatCodec {
-    codec: nemo_relay::codec::openai_chat::OpenAIChatCodec,
+    codec: nemo_relay_codecs::openai_chat::OpenAIChatCodec,
+    response_codec: Arc<dyn LlmResponseCodec>,
 }
 
 #[napi]
@@ -614,7 +618,8 @@ impl OpenAIChatCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            codec: nemo_relay::codec::openai_chat::OpenAIChatCodec,
+            codec: nemo_relay_codecs::openai_chat::OpenAIChatCodec,
+            response_codec: nemo_relay_runtime::codec::response_codec(ProviderSurface::OpenAIChat),
         }
     }
 
@@ -633,7 +638,7 @@ impl OpenAIChatCodec {
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&self.codec, &response)
+        decode_response(&*self.response_codec, &response)
     }
 }
 
@@ -643,7 +648,8 @@ impl OpenAIChatCodec {
 /// (decodeResponse). Construct with `new OpenAIResponsesCodec()`.
 #[napi(js_name = "OpenAIResponsesCodec")]
 pub struct OpenAIResponsesCodec {
-    codec: nemo_relay::codec::openai_responses::OpenAIResponsesCodec,
+    codec: nemo_relay_codecs::openai_responses::OpenAIResponsesCodec,
+    response_codec: Arc<dyn LlmResponseCodec>,
 }
 
 #[napi]
@@ -651,7 +657,10 @@ impl OpenAIResponsesCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            codec: nemo_relay::codec::openai_responses::OpenAIResponsesCodec,
+            codec: nemo_relay_codecs::openai_responses::OpenAIResponsesCodec,
+            response_codec: nemo_relay_runtime::codec::response_codec(
+                ProviderSurface::OpenAIResponses,
+            ),
         }
     }
 
@@ -670,7 +679,7 @@ impl OpenAIResponsesCodec {
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&self.codec, &response)
+        decode_response(&*self.response_codec, &response)
     }
 }
 
@@ -680,7 +689,8 @@ impl OpenAIResponsesCodec {
 /// (decodeResponse). Construct with `new GeminiGenerateContentCodec()`.
 #[napi(js_name = "GeminiGenerateContentCodec")]
 pub struct GeminiGenerateContentCodec {
-    codec: nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
+    codec: nemo_relay_codecs::gemini_generate_content::GeminiGenerateContentCodec,
+    response_codec: Arc<dyn LlmResponseCodec>,
 }
 
 #[napi]
@@ -688,7 +698,10 @@ impl GeminiGenerateContentCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            codec: nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
+            codec: nemo_relay_codecs::gemini_generate_content::GeminiGenerateContentCodec,
+            response_codec: nemo_relay_runtime::codec::response_codec(
+                ProviderSurface::GeminiGenerateContent,
+            ),
         }
     }
 
@@ -712,7 +725,10 @@ impl GeminiGenerateContentCodec {
         env: Env,
         #[napi(ts_arg_type = "any")] response: Unknown,
     ) -> Result<Json> {
-        decode_response(&self.codec, &crate::convert::checked_json(&env, response)?)
+        decode_response(
+            &*self.response_codec,
+            &crate::convert::checked_json(&env, response)?,
+        )
     }
 }
 
@@ -722,7 +738,8 @@ impl GeminiGenerateContentCodec {
 /// (decodeResponse). Construct with `new AnthropicMessagesCodec()`.
 #[napi]
 pub struct AnthropicMessagesCodec {
-    codec: nemo_relay::codec::anthropic::AnthropicMessagesCodec,
+    codec: nemo_relay_codecs::anthropic::AnthropicMessagesCodec,
+    response_codec: Arc<dyn LlmResponseCodec>,
 }
 
 #[napi]
@@ -730,7 +747,10 @@ impl AnthropicMessagesCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            codec: nemo_relay::codec::anthropic::AnthropicMessagesCodec,
+            codec: nemo_relay_codecs::anthropic::AnthropicMessagesCodec,
+            response_codec: nemo_relay_runtime::codec::response_codec(
+                ProviderSurface::AnthropicMessages,
+            ),
         }
     }
 
@@ -749,7 +769,7 @@ impl AnthropicMessagesCodec {
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&self.codec, &response)
+        decode_response(&*self.response_codec, &response)
     }
 }
 
@@ -759,7 +779,8 @@ impl AnthropicMessagesCodec {
 /// (decodeResponse). Construct with `new OCIGenAIChatCodec()`.
 #[napi(js_name = "OCIGenAIChatCodec")]
 pub struct OCIGenAIChatCodec {
-    codec: nemo_relay::codec::oci_genai::OCIGenAIChatCodec,
+    codec: nemo_relay_codecs::oci_genai::OCIGenAIChatCodec,
+    response_codec: Arc<dyn LlmResponseCodec>,
 }
 
 #[napi]
@@ -767,7 +788,8 @@ impl OCIGenAIChatCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            codec: nemo_relay::codec::oci_genai::OCIGenAIChatCodec,
+            codec: nemo_relay_codecs::oci_genai::OCIGenAIChatCodec,
+            response_codec: nemo_relay_runtime::codec::response_codec(ProviderSurface::OCIGenAI),
         }
     }
 
@@ -786,6 +808,6 @@ impl OCIGenAIChatCodec {
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&self.codec, &response)
+        decode_response(&*self.response_codec, &response)
     }
 }
