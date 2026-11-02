@@ -54,9 +54,7 @@ use nemo_relay_plugin_host::{
 use nemo_relay_runtime::api::llm as core_llm_api;
 use nemo_relay_runtime::api::llm::{LlmAttributes, LlmRequest};
 use nemo_relay_runtime::api::registry as core_registry_api;
-use nemo_relay_runtime::api::runtime::subscriber_dispatcher::{
-    PublicationBuffer, with_nested_publication_buffer,
-};
+use nemo_relay_runtime::api::runtime::subscriber_dispatcher::with_nested_publication_buffer;
 use nemo_relay_runtime::api::runtime::{
     ConditionalMiddlewareGuardrailFn, LlmCollector, LlmExecutionNextFn, LlmFinalizer,
     LlmJsonStream, ToolExecutionNextFn,
@@ -586,15 +584,6 @@ fn effective_scope(env: &Env) -> Result<CallbackScope> {
     )
 }
 
-fn effective_scope_context(
-    env: &Env,
-) -> Result<(
-    nemo_relay_runtime::api::runtime::ScopeStackHandle,
-    Option<PublicationBuffer>,
-)> {
-    effective_scope(env).map(|scope| (scope.scope_stack, scope.publication_buffer))
-}
-
 fn with_callback_scope<T>(scope: &CallbackScope, callback: impl FnOnce() -> T) -> T {
     with_scope_stack_handle(scope.scope_stack.clone(), || {
         with_nested_publication_buffer(scope.publication_buffer.clone(), callback)
@@ -605,10 +594,45 @@ fn with_effective_scope_stack<T>(env: &Env, callback: impl FnOnce() -> T) -> Res
     Ok(with_callback_scope(&effective_scope(env)?, callback))
 }
 
-fn effective_scope_top(
-    scope_stack: &nemo_relay_runtime::api::runtime::ScopeStackHandle,
-) -> nemo_relay_runtime::api::scope::ScopeHandle {
-    with_scope_stack_handle(scope_stack.clone(), task_scope_top)
+fn parse_scope_uuid(scope_uuid: &str) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(scope_uuid)
+        .map_err(|error| Error::invalid_argument(format!("invalid UUID: {error}")))
+}
+
+struct CallContext {
+    publication_context_id: Option<String>,
+    scope: CallbackScope,
+}
+
+impl CallContext {
+    fn capture(env: &Env) -> Result<Self> {
+        Ok(Self {
+            publication_context_id: callback_factory::event_sanitizer_callback_context_id(env)?,
+            scope: effective_scope(env)?,
+        })
+    }
+
+    fn parent(&self, handle: Option<&ScopeHandle>) -> core_scope_api::ScopeHandle {
+        match handle {
+            Some(handle) => handle.inner.clone(),
+            None => with_scope_stack_handle(self.scope.scope_stack.clone(), task_scope_top),
+        }
+    }
+
+    fn enter<T>(&self, callback: impl FnOnce() -> T) -> T {
+        with_callback_scope(&self.scope, callback)
+    }
+
+    fn run<F>(self, future: F) -> impl Future<Output = F::Output> + Send + 'static
+    where
+        F: Future + Send + 'static,
+    {
+        with_publication_callback_context(
+            self.publication_context_id,
+            self.scope.publication_buffer,
+            TASK_SCOPE_STACK.scope(self.scope.scope_stack, future),
+        )
+    }
 }
 
 #[napi_derive::module_init]
@@ -1062,34 +1086,42 @@ fn serialize_llm_request(request: &LlmRequest) -> FlowResult<Json> {
         .map_err(|error| FlowError::Internal(format!("failed to serialize LlmRequest: {error}")))
 }
 
+async fn scoped_call(
+    func: &Tsfn<ScopedJsonCall, JsArgs2, JsArg>,
+    value: Json,
+    scope: CallbackScope,
+    name: &'static str,
+) -> FlowResult<Json> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let status = func.call_with_return_value(
+        ScopedJsonCall { value, scope },
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |value: napi::Result<JsArg>, env| {
+            let _ = tx.send(callable::tsfn_envelope(
+                &env,
+                value,
+                &format!("{name} failed"),
+            ));
+            Ok(())
+        },
+    );
+    if status != napi::Status::Ok {
+        return Err(FlowError::Internal(format!(
+            "failed to queue {name}: {status:?}",
+        )));
+    }
+    rx.await
+        .map_err(|error| FlowError::Internal(error.to_string()))?
+}
+
 fn scoped_tool_execution_fn(func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>) -> ToolExecutionNextFn {
     let func = Arc::new(func);
     Arc::new(move |args: Json| {
         let func = func.clone();
         let scope = CallbackScope::capture();
         Box::pin(async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let status = func.call_with_return_value(
-                ScopedJsonCall { value: args, scope },
-                ThreadsafeFunctionCallMode::NonBlocking,
-                move |value: napi::Result<JsArg>, env| {
-                    let _ = tx.send(callable::tsfn_envelope(
-                        &env,
-                        value,
-                        "JS tool execution callback failed",
-                    ));
-                    Ok(())
-                },
-            );
-            if status != napi::Status::Ok {
-                return Err(FlowError::Internal(format!(
-                    "failed to queue JS tool execution callback: {status:?}",
-                )));
-            }
-            let result = rx
-                .await
-                .map_err(|error| FlowError::Internal(error.to_string()))?;
-            callable::parse_tool_execution_result(result?)
+            let result = scoped_call(&func, args, scope, "JS tool execution callback").await?;
+            callable::parse_tool_execution_result(result)
         })
     })
 }
@@ -1101,29 +1133,7 @@ fn scoped_llm_execution_fn(func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>) -> LlmExe
         let scope = CallbackScope::capture();
         Box::pin(async move {
             let request = serialize_llm_request(&request)?;
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let status = func.call_with_return_value(
-                ScopedJsonCall {
-                    value: request,
-                    scope,
-                },
-                ThreadsafeFunctionCallMode::NonBlocking,
-                move |value: napi::Result<JsArg>, env| {
-                    let _ = tx.send(callable::tsfn_envelope(
-                        &env,
-                        value,
-                        "JS LLM execution callback failed",
-                    ));
-                    Ok(())
-                },
-            );
-            if status != napi::Status::Ok {
-                return Err(FlowError::Internal(format!(
-                    "failed to queue JS LLM execution callback: {status:?}",
-                )));
-            }
-            rx.await
-                .map_err(|error| FlowError::Internal(error.to_string()))?
+            scoped_call(&func, request, scope, "JS LLM execution callback").await
         })
     })
 }
@@ -1510,7 +1520,7 @@ impl Plugin for NodePlugin {
                 namespace_prefix,
                 registrations: registrations.clone(),
             };
-            let (tx, rx) = std::sync::mpsc::sync_channel::<FlowResult<()>>(1);
+            let (tx, rx) = tokio::sync::oneshot::channel::<FlowResult<()>>();
             let status = self.register.call_with_return_value(
                 payload,
                 ThreadsafeFunctionCallMode::NonBlocking,
@@ -1527,7 +1537,7 @@ impl Plugin for NodePlugin {
                     "failed to queue JS plugin register callback: {status:?}"
                 )))
             } else {
-                rx.recv()
+                rx.await
                     .map_err(|_| {
                         PluginError::RegistrationFailed(
                             "JS plugin register completion channel closed".into(),
@@ -2047,11 +2057,10 @@ pub fn with_scope<'env>(
     input: Option<Json>,
 ) -> Result<PromiseRaw<'env, Json>> {
     let attrs = ScopeAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
+    let context = CallContext::capture(env)?;
     let pa_fn = Arc::new(PromiseAwareFn::new(env, &callback)?);
-    let scope_handle = with_scope_stack_handle(scope_stack.clone(), || {
-        with_nested_publication_buffer(publication_buffer.clone(), || {
+    let scope_handle = context
+        .enter(|| {
             core_scope_api::push_scope(
                 core_scope_api::PushScopeParams::builder()
                     .name(name.as_str())
@@ -2064,60 +2073,39 @@ pub fn with_scope<'env>(
                     .build(),
             )
         })
-    })
-    .map_err(Error::from)?;
+        .map_err(Error::from)?;
     let scope_uuid = scope_handle.uuid;
 
-    // Hand the callback a real `ScopeHandle` instance, matching the Rust and
-    // Python bindings, so it can be passed back into `event`,
-    // `toolCallExecute`, and `llmCallExecute`. The instance is materialized on
-    // the JS thread because a `napi_wrap`'d handle cannot cross the
-    // threadsafe-function boundary as plain JSON.
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            let build_handle: crate::promise_call::Arg0Builder =
-                                Box::new(move |env: &Env| {
-                                    js_value(env, ScopeHandle::from(scope_handle))
-                                });
+        context.run(async move {
+            let build_handle: crate::promise_call::Arg0Builder =
+                Box::new(move |env: &Env| js_value(env, ScopeHandle::from(scope_handle)));
 
-                            let result = pa_fn.call_with_arg0(build_handle).await;
-                            let metadata = match &result {
-                                Ok(_) => otel_status_metadata("OK", None),
-                                Err(error) => {
-                                    otel_status_metadata("ERROR", Some(error.to_string()))
-                                }
-                            };
-                            let popped = core_scope_api::pop_scope(
-                                core_scope_api::PopScopeParams::builder()
-                                    .handle_uuid(&scope_uuid)
-                                    .metadata_opt(Some(metadata))
-                                    .build(),
-                            );
-                            match (result, popped) {
-                                (Ok(value), Ok(())) => Ok(value),
-                                (Ok(_), Err(pop_error)) => Err(Error::from(pop_error)),
-                                (Err(error), popped) => {
-                                    if let Err(pop_error) = popped {
-                                        record_callback_error(format!(
-                                            "nemo_relay: failed to pop scope after a withScope callback failed: {pop_error}"
-                                        ));
-                                    }
-                                    Err(Error::from(error))
-                                }
-                            }
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+            let result = pa_fn.call_with_arg0(build_handle).await;
+            let metadata = match &result {
+                Ok(_) => otel_status_metadata("OK", None),
+                Err(error) => otel_status_metadata("ERROR", Some(error.to_string())),
+            };
+            let popped = core_scope_api::pop_scope(
+                core_scope_api::PopScopeParams::builder()
+                    .handle_uuid(&scope_uuid)
+                    .metadata_opt(Some(metadata))
+                    .build(),
+            );
+            match (result, popped) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Ok(_), Err(pop_error)) => Err(Error::from(pop_error)),
+                (Err(error), popped) => {
+                    if let Err(pop_error) = popped {
+                        record_callback_error(format!(
+                            "nemo_relay: failed to pop scope after a withScope callback failed: {pop_error}"
+                        ));
+                    }
+                    Err(Error::from(error))
+                }
+            }
+        }),
         js_value,
     )
 }
@@ -2291,44 +2279,30 @@ pub fn tool_call_execute<'env>(
     tool_call_id: Option<String>,
 ) -> Result<PromiseRaw<'env, ToolExecutionResult>> {
     let attrs = ToolAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
-    let parent = handle
-        .map(|h| h.inner.clone())
-        .unwrap_or_else(|| effective_scope_top(&scope_stack));
+    let context = CallContext::capture(env)?;
+    let parent = context.parent(handle);
     let callback: Function<JsArg, JsArg> = callback_factory::wrap_execution_callback(env, &func)?;
     let default_fn = scoped_tool_execution_fn(scoped_json_callback_tsfn(env, &callback)?);
 
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            core_tool_api::tool_call_execute(
-                                core_tool_api::ToolCallExecuteParams::builder()
-                                    .name(name)
-                                    .args(args)
-                                    .func(default_fn)
-                                    .parent(parent)
-                                    .attributes(attrs)
-                                    .data_opt(opt_json(data))
-                                    .metadata_opt(opt_json(metadata))
-                                    .tool_call_id_opt(tool_call_id)
-                                    .build(),
-                            )
-                            .await
-                            .map(ToolExecutionResult::from)
-                            .map_err(Error::from)
-                        })
-                        .await
-                },
+        context.run(async move {
+            core_tool_api::tool_call_execute(
+                core_tool_api::ToolCallExecuteParams::builder()
+                    .name(name)
+                    .args(args)
+                    .func(default_fn)
+                    .parent(parent)
+                    .attributes(attrs)
+                    .data_opt(opt_json(data))
+                    .metadata_opt(opt_json(metadata))
+                    .tool_call_id_opt(tool_call_id)
+                    .build(),
             )
             .await
-        },
+            .map(ToolExecutionResult::from)
+            .map_err(Error::from)
+        }),
         js_value,
     )
 }
@@ -2354,11 +2328,8 @@ pub fn tool_call_execute_async<'env>(
     tool_call_id: Option<String>,
 ) -> Result<PromiseRaw<'env, ToolExecutionResult>> {
     let attrs = ToolAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
-    let parent = handle
-        .map(|h| h.inner.clone())
-        .unwrap_or_else(|| effective_scope_top(&scope_stack));
+    let context = CallContext::capture(env)?;
+    let parent = context.parent(handle);
 
     let pa_fn = Arc::new(PromiseAwareFn::new(env, &func)?);
 
@@ -2372,34 +2343,23 @@ pub fn tool_call_execute_async<'env>(
 
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            core_tool_api::tool_call_execute(
-                                core_tool_api::ToolCallExecuteParams::builder()
-                                    .name(name)
-                                    .args(args)
-                                    .func(exec_fn)
-                                    .parent(parent)
-                                    .attributes(attrs)
-                                    .data_opt(opt_json(data))
-                                    .metadata_opt(opt_json(metadata))
-                                    .tool_call_id_opt(tool_call_id)
-                                    .build(),
-                            )
-                            .await
-                            .map(ToolExecutionResult::from)
-                            .map_err(Error::from)
-                        })
-                        .await
-                },
+        context.run(async move {
+            core_tool_api::tool_call_execute(
+                core_tool_api::ToolCallExecuteParams::builder()
+                    .name(name)
+                    .args(args)
+                    .func(exec_fn)
+                    .parent(parent)
+                    .attributes(attrs)
+                    .data_opt(opt_json(data))
+                    .metadata_opt(opt_json(metadata))
+                    .tool_call_id_opt(tool_call_id)
+                    .build(),
             )
             .await
-        },
+            .map(ToolExecutionResult::from)
+            .map_err(Error::from)
+        }),
         js_value,
     )
 }
@@ -2521,11 +2481,8 @@ pub fn llm_call_execute<'env>(
     #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<Callback>,
 ) -> Result<PromiseRaw<'env, Json>> {
     let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
-    let parent = handle
-        .map(|h| h.inner.clone())
-        .unwrap_or_else(|| effective_scope_top(&scope_stack));
+    let context = CallContext::capture(env)?;
+    let parent = context.parent(handle);
     let llm_request: LlmRequest = serde_json::from_value(request)
         .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
     let callback: Function<JsArg, JsArg> = callback_factory::wrap_execution_callback(env, &func)?;
@@ -2534,36 +2491,23 @@ pub fn llm_call_execute<'env>(
     let response_codec = node_llm_response_codec(env, response_codec_decode.as_deref())?;
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            let params = core_llm_api::LlmCallExecuteParams::builder()
-                                .name(name)
-                                .request(llm_request)
-                                .func(default_fn)
-                                .parent(parent)
-                                .attributes(attrs)
-                                .data_opt(opt_json(data))
-                                .metadata_opt(opt_json(metadata))
-                                .model_name_opt(model_name)
-                                .codec_opt(codec)
-                                .response_codec_opt(response_codec)
-                                .build();
-                            // Construct the large core future when Tokio polls this
-                            // bridge, keeping it out of the JavaScript caller's stack.
-                            Box::pin(core_llm_api::llm_call_execute(params))
-                                .await
-                                .map_err(Error::from)
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+        context.run(async move {
+            let params = core_llm_api::LlmCallExecuteParams::builder()
+                .name(name)
+                .request(llm_request)
+                .func(default_fn)
+                .parent(parent)
+                .attributes(attrs)
+                .data_opt(opt_json(data))
+                .metadata_opt(opt_json(metadata))
+                .model_name_opt(model_name)
+                .codec_opt(codec)
+                .response_codec_opt(response_codec)
+                .build();
+            Box::pin(core_llm_api::llm_call_execute(params))
+                .await
+                .map_err(Error::from)
+        }),
         js_value,
     )
 }
@@ -2589,11 +2533,8 @@ pub fn llm_call_execute_async<'env>(
     #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<Callback>,
 ) -> Result<PromiseRaw<'env, Json>> {
     let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
-    let parent = handle
-        .map(|h| h.inner.clone())
-        .unwrap_or_else(|| effective_scope_top(&scope_stack));
+    let context = CallContext::capture(env)?;
+    let parent = context.parent(handle);
     let llm_request: LlmRequest = serde_json::from_value(request)
         .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
     let pa_fn = Arc::new(PromiseAwareFn::new(env, &func)?);
@@ -2608,34 +2549,23 @@ pub fn llm_call_execute_async<'env>(
 
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            let params = core_llm_api::LlmCallExecuteParams::builder()
-                                .name(name)
-                                .request(llm_request)
-                                .func(exec_fn)
-                                .parent(parent)
-                                .attributes(attrs)
-                                .data_opt(opt_json(data))
-                                .metadata_opt(opt_json(metadata))
-                                .model_name_opt(model_name)
-                                .codec_opt(codec)
-                                .response_codec_opt(response_codec)
-                                .build();
-                            Box::pin(core_llm_api::llm_call_execute(params))
-                                .await
-                                .map_err(Error::from)
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+        context.run(async move {
+            let params = core_llm_api::LlmCallExecuteParams::builder()
+                .name(name)
+                .request(llm_request)
+                .func(exec_fn)
+                .parent(parent)
+                .attributes(attrs)
+                .data_opt(opt_json(data))
+                .metadata_opt(opt_json(metadata))
+                .model_name_opt(model_name)
+                .codec_opt(codec)
+                .response_codec_opt(response_codec)
+                .build();
+            Box::pin(core_llm_api::llm_call_execute(params))
+                .await
+                .map_err(Error::from)
+        }),
         js_value,
     )
 }
@@ -2682,11 +2612,8 @@ pub fn llm_stream_call_execute<'env>(
     #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<Callback>,
 ) -> Result<PromiseRaw<'env, LlmStream>> {
     let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
-    let parent = handle
-        .map(|h| h.inner.clone())
-        .unwrap_or_else(|| effective_scope_top(&scope_stack));
+    let context = CallContext::capture(env)?;
+    let parent = context.parent(handle);
     let llm_request: LlmRequest = serde_json::from_value(request)
         .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
 
@@ -2709,47 +2636,37 @@ pub fn llm_stream_call_execute<'env>(
 
     let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
     let response_codec = node_llm_response_codec(env, response_codec_decode.as_deref())?;
+    let stream_context_id = context.publication_context_id.clone();
+    let stream_publication_buffer = context.scope.publication_buffer.clone();
     spawn_promise::<_, _, Error, _, _>(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id.clone(),
-                publication_buffer.clone(),
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            let params = core_llm_api::LlmStreamCallExecuteParams::builder()
-                                .name(name)
-                                .request(llm_request)
-                                .func(default_fn)
-                                .collector(wrapped_collector)
-                                .finalizer(wrapped_finalizer)
-                                .parent(parent)
-                                .attributes(attrs)
-                                .data_opt(opt_json(data))
-                                .metadata_opt(opt_json(metadata))
-                                .model_name_opt(model_name)
-                                .codec_opt(codec)
-                                .response_codec_opt(response_codec)
-                                .build();
-                            let rust_stream =
-                                Box::pin(core_llm_api::llm_stream_call_execute(params))
-                                    .await
-                                    .map_err(Error::from)?;
+        context.run(async move {
+            let params = core_llm_api::LlmStreamCallExecuteParams::builder()
+                .name(name)
+                .request(llm_request)
+                .func(default_fn)
+                .collector(wrapped_collector)
+                .finalizer(wrapped_finalizer)
+                .parent(parent)
+                .attributes(attrs)
+                .data_opt(opt_json(data))
+                .metadata_opt(opt_json(metadata))
+                .model_name_opt(model_name)
+                .codec_opt(codec)
+                .response_codec_opt(response_codec)
+                .build();
+            let rust_stream = Box::pin(core_llm_api::llm_stream_call_execute(params))
+                .await
+                .map_err(Error::from)?;
 
-                            Ok(LlmStream::new(
-                                rust_stream,
-                                finalizer_error,
-                                producers,
-                                publication_context_id,
-                                publication_buffer,
-                            ))
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+            Ok(LlmStream::new(
+                rust_stream,
+                finalizer_error,
+                producers,
+                stream_context_id,
+                stream_publication_buffer,
+            ))
+        }),
         js_value,
     )
 }
@@ -3507,8 +3424,7 @@ pub fn scope_register_event_metadata_injector(
     #[napi(ts_arg_type = "(event: Json) => EventMetadata | Promise<EventMetadata>")]
     injector: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|error| Error::invalid_argument(format!("invalid UUID: {error}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_event_metadata_injector(
         &uuid,
         &name,
@@ -3521,8 +3437,7 @@ pub fn scope_register_event_metadata_injector(
 /// Deregister a scope-local event metadata injector by name.
 #[napi(catch_unwind)]
 pub fn scope_deregister_event_metadata_injector(scope_uuid: String, name: String) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|error| Error::invalid_argument(format!("invalid UUID: {error}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_event_metadata_injector(&uuid, &name).map_err(Error::from)
 }
 
@@ -3547,8 +3462,7 @@ macro_rules! napi_scope_event_guardrail_api {
             )]
             guardrail: Callback,
         ) -> Result<()> {
-            let uuid = uuid::Uuid::parse_str(&scope_uuid)
-                .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+            let uuid = parse_scope_uuid(&scope_uuid)?;
             $core_register(
                 &uuid,
                 &name,
@@ -3560,8 +3474,7 @@ macro_rules! napi_scope_event_guardrail_api {
 
         #[napi(catch_unwind)]
         pub fn $deregister_name(scope_uuid: String, name: String) -> Result<bool> {
-            let uuid = uuid::Uuid::parse_str(&scope_uuid)
-                .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+            let uuid = parse_scope_uuid(&scope_uuid)?;
             $core_deregister(&uuid, &name).map_err(Error::from)
         }
     };
@@ -3602,8 +3515,7 @@ macro_rules! napi_scope_guardrail_tool_api {
             )]
             guardrail: Callback,
         ) -> Result<()> {
-            let uuid = uuid::Uuid::parse_str(&scope_uuid)
-                .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+            let uuid = parse_scope_uuid(&scope_uuid)?;
             $core_register(
                 &uuid,
                 &name,
@@ -3616,8 +3528,7 @@ macro_rules! napi_scope_guardrail_tool_api {
         $(#[doc = $dereg_doc])*
         #[napi(catch_unwind)]
         pub fn $deregister_name(scope_uuid: String, name: String) -> Result<bool> {
-            let uuid = uuid::Uuid::parse_str(&scope_uuid)
-                .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+            let uuid = parse_scope_uuid(&scope_uuid)?;
             $core_deregister(&uuid, &name).map_err(Error::from)
         }
     };
@@ -3673,8 +3584,7 @@ pub fn scope_register_tool_conditional_execution_guardrail(
     )]
     guardrail: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_tool_conditional_execution_guardrail(
         &uuid,
         &name,
@@ -3692,8 +3602,7 @@ pub fn scope_deregister_tool_conditional_execution_guardrail(
     scope_uuid: String,
     name: String,
 ) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_tool_conditional_execution_guardrail(&uuid, &name)
         .map_err(Error::from)
 }
@@ -3719,8 +3628,7 @@ macro_rules! napi_scope_intercept_tool_api {
             )]
             callable: Callback,
         ) -> Result<()> {
-            let uuid = uuid::Uuid::parse_str(&scope_uuid)
-                .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+            let uuid = parse_scope_uuid(&scope_uuid)?;
             $core_register(
                 &uuid,
                 &name,
@@ -3734,8 +3642,7 @@ macro_rules! napi_scope_intercept_tool_api {
         $(#[doc = $dereg_doc])*
         #[napi(catch_unwind)]
         pub fn $deregister_name(scope_uuid: String, name: String) -> Result<bool> {
-            let uuid = uuid::Uuid::parse_str(&scope_uuid)
-                .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+            let uuid = parse_scope_uuid(&scope_uuid)?;
             $core_deregister(&uuid, &name).map_err(Error::from)
         }
     };
@@ -3774,8 +3681,7 @@ pub fn scope_register_tool_execution_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_tool_execution_intercept(
         &uuid,
         &name,
@@ -3792,8 +3698,7 @@ pub fn scope_register_tool_execution_intercept(
 /// specified scope.
 #[napi(catch_unwind)]
 pub fn scope_deregister_tool_execution_intercept(scope_uuid: String, name: String) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_tool_execution_intercept(&uuid, &name).map_err(Error::from)
 }
 
@@ -3819,8 +3724,7 @@ pub fn scope_register_llm_sanitize_request_guardrail(
     )]
     guardrail: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_llm_sanitize_request_guardrail(
         &uuid,
         &name,
@@ -3838,8 +3742,7 @@ pub fn scope_deregister_llm_sanitize_request_guardrail(
     scope_uuid: String,
     name: String,
 ) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_llm_sanitize_request_guardrail(&uuid, &name)
         .map_err(Error::from)
 }
@@ -3862,8 +3765,7 @@ pub fn scope_register_llm_sanitize_response_guardrail(
     )]
     guardrail: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_llm_sanitize_response_guardrail(
         &uuid,
         &name,
@@ -3881,8 +3783,7 @@ pub fn scope_deregister_llm_sanitize_response_guardrail(
     scope_uuid: String,
     name: String,
 ) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_llm_sanitize_response_guardrail(&uuid, &name)
         .map_err(Error::from)
 }
@@ -3901,8 +3802,7 @@ pub fn scope_register_llm_conditional_execution_guardrail(
     #[napi(ts_arg_type = "(request: Json) => string | null | Promise<string | null>")]
     guardrail: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_llm_conditional_execution_guardrail(
         &uuid,
         &name,
@@ -3920,8 +3820,7 @@ pub fn scope_deregister_llm_conditional_execution_guardrail(
     scope_uuid: String,
     name: String,
 ) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_llm_conditional_execution_guardrail(&uuid, &name)
         .map_err(Error::from)
 }
@@ -3948,8 +3847,7 @@ pub fn scope_register_llm_request_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_llm_request_intercept(
         &uuid,
         &name,
@@ -3965,8 +3863,7 @@ pub fn scope_register_llm_request_intercept(
 /// Returns `true` if an intercept with that name was found and removed from the specified scope.
 #[napi(catch_unwind)]
 pub fn scope_deregister_llm_request_intercept(scope_uuid: String, name: String) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_llm_request_intercept(&uuid, &name).map_err(Error::from)
 }
 
@@ -3988,8 +3885,7 @@ pub fn scope_register_llm_execution_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_llm_execution_intercept(
         &uuid,
         &name,
@@ -4004,8 +3900,7 @@ pub fn scope_register_llm_execution_intercept(
 /// Returns `true` if an intercept with that name was found and removed from the specified scope.
 #[napi(catch_unwind)]
 pub fn scope_deregister_llm_execution_intercept(scope_uuid: String, name: String) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_llm_execution_intercept(&uuid, &name).map_err(Error::from)
 }
 
@@ -4031,8 +3926,7 @@ pub fn scope_register_llm_stream_execution_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_register_llm_stream_execution_intercept(
         &uuid,
         &name,
@@ -4050,8 +3944,7 @@ pub fn scope_deregister_llm_stream_execution_intercept(
     scope_uuid: String,
     name: String,
 ) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_registry_api::scope_deregister_llm_stream_execution_intercept(&uuid, &name)
         .map_err(Error::from)
 }
@@ -4075,8 +3968,7 @@ pub fn scope_register_subscriber(
     name: String,
     #[napi(ts_arg_type = "(event: Json) => void | Promise<void>")] callback: Callback,
 ) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     let callback = callable::wrap_js_event_subscriber(&env, name.clone(), &callback)?;
     core_subscriber_api::scope_register_subscriber(&uuid, &name, callback).map_err(Error::from)
 }
@@ -4086,8 +3978,7 @@ pub fn scope_register_subscriber(
 /// Returns `true` if a subscriber with that name was found and removed from the specified scope.
 #[napi(catch_unwind)]
 pub fn scope_deregister_subscriber(scope_uuid: String, name: String) -> Result<bool> {
-    let uuid = uuid::Uuid::parse_str(&scope_uuid)
-        .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
+    let uuid = parse_scope_uuid(&scope_uuid)?;
     core_subscriber_api::scope_deregister_subscriber(&uuid, &name).map_err(Error::from)
 }
 
@@ -4103,26 +3994,14 @@ pub fn tool_request_intercepts<'env>(
     name: String,
     args: Json,
 ) -> Result<PromiseRaw<'env, Json>> {
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
+    let context = CallContext::capture(env)?;
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            core_tool_api::tool_request_intercepts(&name, args)
-                                .await
-                                .map_err(Error::from)
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+        context.run(async move {
+            core_tool_api::tool_request_intercepts(&name, args)
+                .await
+                .map_err(Error::from)
+        }),
         js_value,
     )
 }
@@ -4135,26 +4014,14 @@ pub fn tool_conditional_execution<'env>(
     name: String,
     args: Json,
 ) -> Result<PromiseRaw<'env, ()>> {
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
+    let context = CallContext::capture(env)?;
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            core_tool_api::tool_conditional_execution(&name, &args)
-                                .await
-                                .map_err(Error::from)
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+        context.run(async move {
+            core_tool_api::tool_conditional_execution(&name, &args)
+                .await
+                .map_err(Error::from)
+        }),
         |env, _| js_value(env, ()),
     )
 }
@@ -4170,34 +4037,22 @@ pub fn llm_request_intercepts<'env>(
 ) -> Result<PromiseRaw<'env, Json>> {
     let llm_request: LlmRequest = serde_json::from_value(request)
         .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
+    let context = CallContext::capture(env)?;
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            Box::pin(core_llm_api::llm_request_intercepts(&name, llm_request))
-                                .await
-                                .map(|r| {
-                                    serde_json::json!({
-                                        "request": r.request,
-                                        "annotated": r.annotated_request,
-                                        "pendingMarks": callable::js_pending_marks(r.pending_marks),
-                                        "optimizationContributions": r.optimization_contributions,
-                                    })
-                                })
-                                .map_err(Error::from)
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+        context.run(async move {
+            Box::pin(core_llm_api::llm_request_intercepts(&name, llm_request))
+                .await
+                .map(|r| {
+                    serde_json::json!({
+                        "request": r.request,
+                        "annotated": r.annotated_request,
+                        "pendingMarks": callable::js_pending_marks(r.pending_marks),
+                        "optimizationContributions": r.optimization_contributions,
+                    })
+                })
+                .map_err(Error::from)
+        }),
         js_value,
     )
 }
@@ -4212,26 +4067,14 @@ pub fn llm_conditional_execution<'env>(
 ) -> Result<PromiseRaw<'env, ()>> {
     let llm_request: LlmRequest = serde_json::from_value(request)
         .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-    let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
-    let (scope_stack, publication_buffer) = effective_scope_context(env)?;
+    let context = CallContext::capture(env)?;
     spawn_promise(
         env,
-        async move {
-            with_publication_callback_context(
-                publication_context_id,
-                publication_buffer,
-                async move {
-                    TASK_SCOPE_STACK
-                        .scope(scope_stack, async move {
-                            core_llm_api::llm_conditional_execution(&llm_request)
-                                .await
-                                .map_err(Error::from)
-                        })
-                        .await
-                },
-            )
-            .await
-        },
+        context.run(async move {
+            core_llm_api::llm_conditional_execution(&llm_request)
+                .await
+                .map_err(Error::from)
+        }),
         |env, _| js_value(env, ()),
     )
 }

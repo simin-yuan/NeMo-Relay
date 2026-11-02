@@ -305,15 +305,14 @@
             };
     const invoke = () => {
       Promise.resolve()
-        .then(() =>
-          safeNext === undefined
-            ? spread
-              ? fn(...arg0, controller.signal)
-              : fn(arg0, controller.signal)
-            : spread
-              ? fn(...arg0, safeNext, controller.signal)
-              : fn(arg0, safeNext, controller.signal),
-        )
+        .then(() => {
+          const args = spread ? [...arg0] : [arg0];
+          if (safeNext !== undefined) {
+            args.push(safeNext);
+          }
+          args.push(controller.signal);
+          return fn(...args);
+        })
         .then(async (value) => {
           if (!streamResult) {
             settlePublication();

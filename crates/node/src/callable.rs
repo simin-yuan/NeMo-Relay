@@ -228,6 +228,12 @@ async fn await_callback_result(
         .map_err(|error| FlowError::Internal(format!("{error_prefix}: {error}")))?
 }
 
+fn recorded_internal(message: String) -> FlowError {
+    let error = FlowError::Internal(message);
+    record_callback_error(error.to_string());
+    error
+}
+
 /// Wrap a Promise-aware JS `(name, args) => string | null` tool guardrail.
 pub fn wrap_js_tool_conditional_promise_fn(
     env: &Env,
@@ -238,19 +244,15 @@ pub fn wrap_js_tool_conditional_promise_fn(
         let func = func.clone();
         Box::pin(async move {
             let value = func
-                .call_spread(vec![Json::String(name), args])
+                .call_spread(vec![Json::String(name), args], false)
                 .await
                 .inspect_err(|error| record_callback_error(error.to_string()))?;
             match value {
                 Json::Null => Ok(None),
                 Json::String(reason) => Ok(Some(reason)),
-                other => {
-                    let error = FlowError::Internal(format!(
-                        "JS tool conditional callback failed: expected string or null, got {other:?}"
-                    ));
-                    record_callback_error(error.to_string());
-                    Err(error)
-                }
+                other => Err(recorded_internal(format!(
+                    "JS tool conditional callback failed: expected string or null, got {other:?}"
+                ))),
             }
         })
     }))
@@ -265,7 +267,7 @@ pub fn wrap_js_tool_request_intercept_promise_fn(
     Ok(Arc::new(move |name: String, args: Json| {
         let func = func.clone();
         Box::pin(async move {
-            func.call_spread(vec![Json::String(name), args])
+            func.call_spread(vec![Json::String(name), args], false)
                 .await
                 .inspect_err(|error| record_callback_error(error.to_string()))
         })
@@ -283,15 +285,9 @@ pub fn wrap_js_tool_sanitize_promise_fn(
         let publication =
             nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
         Box::pin(async move {
-            let args = vec![Json::String(name), value];
-            let result = if publication {
-                func.call_spread_for_publication(args).await
-            } else {
-                func.call_spread(args).await
-            };
-            result.inspect_err(|error| {
-                record_callback_error(error.to_string());
-            })
+            func.call_spread(vec![Json::String(name), value], publication)
+                .await
+                .inspect_err(|error| record_callback_error(error.to_string()))
         })
     }))
 }
@@ -309,11 +305,9 @@ pub fn wrap_js_llm_sanitize_request_promise_fn(
                 nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
             Box::pin(async move {
                 let request = serde_json::to_value(request).map_err(|error| {
-                    let error = FlowError::Internal(format!(
+                    recorded_internal(format!(
                         "failed to serialize JS LLM sanitize request: {error}"
-                    ));
-                    record_callback_error(error.to_string());
-                    error
+                    ))
                 })?;
                 let context = js_llm_sanitize_request_context(&context);
                 let build_args: crate::promise_call::Arg0Builder = Box::new(move |env| {
@@ -323,26 +317,18 @@ pub fn wrap_js_llm_sanitize_request_promise_fn(
                     args.set(1, js_llm_sanitize_request_context_to_napi(env, context)?)?;
                     Ok(detach(env, &args))
                 });
-                let value = if publication {
-                    func.call_spread_with_arg0_for_publication(build_args).await
-                } else {
-                    func.call_spread_with_arg0(build_args).await
-                }
-                .inspect_err(|error| {
-                    record_callback_error(error.to_string());
-                })?;
+                let value = func
+                    .call_spread_with_arg0(build_args, publication)
+                    .await
+                    .inspect_err(|error| record_callback_error(error.to_string()))?;
                 if value.is_null() {
                     Ok(None)
                 } else {
-                    serde_json::from_value(value)
-                        .map(Some)
-                        .map_err(|error| {
-                            let error = FlowError::Internal(format!(
-                                "JS LLM sanitize request callback failed: failed to deserialize LlmRequest: {error}"
-                            ));
-                            record_callback_error(error.to_string());
-                            error
-                        })
+                    serde_json::from_value(value).map(Some).map_err(|error| {
+                        recorded_internal(format!(
+                            "JS LLM sanitize request callback failed: failed to deserialize LlmRequest: {error}"
+                        ))
+                    })
                 }
             })
         },
@@ -369,14 +355,10 @@ pub fn wrap_js_llm_sanitize_response_promise_fn(
                     args.set(1, js_llm_sanitize_response_context_to_napi(env, context)?)?;
                     Ok(detach(env, &args))
                 });
-                let value = if publication {
-                    func.call_spread_with_arg0_for_publication(build_args).await
-                } else {
-                    func.call_spread_with_arg0(build_args).await
-                }
-                .inspect_err(|error| {
-                    record_callback_error(error.to_string());
-                })?;
+                let value = func
+                    .call_spread_with_arg0(build_args, publication)
+                    .await
+                    .inspect_err(|error| record_callback_error(error.to_string()))?;
                 Ok((!value.is_null()).then_some(value))
             })
         },
@@ -393,11 +375,9 @@ pub fn wrap_js_llm_conditional_promise_fn(
         let func = func.clone();
         Box::pin(async move {
             let request = serde_json::to_value(request).map_err(|error| {
-                let error = FlowError::Internal(format!(
+                recorded_internal(format!(
                     "failed to serialize JS LLM conditional request: {error}"
-                ));
-                record_callback_error(error.to_string());
-                error
+                ))
             })?;
             let value = func
                 .call(request)
@@ -406,13 +386,9 @@ pub fn wrap_js_llm_conditional_promise_fn(
             match value {
                 Json::Null => Ok(None),
                 Json::String(reason) => Ok(Some(reason)),
-                other => {
-                    let error = FlowError::Internal(format!(
-                        "JS LLM conditional callback failed: expected string or null, got {other:?}"
-                    ));
-                    record_callback_error(error.to_string());
-                    Err(error)
-                }
+                other => Err(recorded_internal(format!(
+                    "JS LLM conditional callback failed: expected string or null, got {other:?}"
+                ))),
             }
         })
     }))
@@ -429,18 +405,14 @@ pub fn wrap_js_llm_request_intercept_promise_fn(
             let func = func.clone();
             Box::pin(async move {
                 let request = serde_json::to_value(request).map_err(|error| {
-                    let error = FlowError::Internal(format!(
+                    recorded_internal(format!(
                         "failed to serialize JS LLM request intercept request: {error}"
-                    ));
-                    record_callback_error(error.to_string());
-                    error
+                    ))
                 })?;
                 let annotated = serde_json::to_value(annotated).map_err(|error| {
-                    let error = FlowError::Internal(format!(
+                    recorded_internal(format!(
                         "failed to serialize JS LLM request intercept annotation: {error}"
-                    ));
-                    record_callback_error(error.to_string());
-                    error
+                    ))
                 })?;
                 let value = serde_json::json!({
                     "name": name,
@@ -462,11 +434,7 @@ pub fn wrap_js_llm_request_intercept_promise_fn(
                     optimization_contributions: Vec<LlmOptimizationContribution>,
                 }
                 let outcome: JsOutcome = serde_json::from_value(value).map_err(|error| {
-                    let error = FlowError::Internal(format!(
-                        "invalid JS LLM request intercept outcome: {error}"
-                    ));
-                    record_callback_error(error.to_string());
-                    error
+                    recorded_internal(format!("invalid JS LLM request intercept outcome: {error}"))
                 })?;
                 Ok(LlmRequestInterceptOutcome {
                     request: outcome.request,
@@ -496,11 +464,9 @@ pub fn wrap_js_event_sanitize_promise_fn(
                 let event_json = JsEvent::try_from_event(&event)
                     .map(JsEvent::into_json)
                     .map_err(|error| {
-                        let error = FlowError::Internal(format!(
+                        recorded_internal(format!(
                             "failed to serialize JS event sanitizer context: {error}"
-                        ));
-                        record_callback_error(error.to_string());
-                        error
+                        ))
                     })?;
                 let js_fields = EventSanitizeFields {
                     data: fields.data,
@@ -510,54 +476,36 @@ pub fn wrap_js_event_sanitize_promise_fn(
                         .map(serde_json::to_value)
                         .transpose()
                         .map_err(|error| {
-                            let error = FlowError::Internal(format!(
+                            recorded_internal(format!(
                                 "failed to serialize JS event sanitizer category profile: {error}"
-                            ));
-                            record_callback_error(error.to_string());
-                            error
+                            ))
                         })?,
                     metadata: fields.metadata,
                 };
                 let args = vec![
                     event_json,
                     serde_json::to_value(js_fields).map_err(|error| {
-                        let error = FlowError::Internal(format!(
+                        recorded_internal(format!(
                             "failed to serialize JS event sanitizer fields: {error}"
-                        ));
-                        record_callback_error(error.to_string());
-                        error
+                        ))
                     })?,
                 ];
                 let publication =
                     nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback(
                     );
-                let value = if publication {
-                    func.call_spread_for_publication(args).await
-                } else {
-                    func.call_spread(args).await
-                }
-                .inspect_err(|error| {
-                    // Scope and mark publication happens on the dispatcher
-                    // thread. The core clears the governed observability fields while
-                    // making the binding-visible failure available to Node.
-                    record_callback_error(error.to_string());
-                })?;
+                let value = func
+                    .call_spread(args, publication)
+                    .await
+                    .inspect_err(|error| record_callback_error(error.to_string()))?;
                 let fields = event_sanitize_fields_from_json(value).map_err(|error| {
-                    let error =
-                        FlowError::Internal(format!("invalid JS event sanitizer result: {error}"));
-                    record_callback_error(error.to_string());
-                    error
+                    recorded_internal(format!("invalid JS event sanitizer result: {error}"))
                 })?;
                 let category_profile = fields
                     .category_profile
                     .map(serde_json::from_value)
                     .transpose()
                     .map_err(|error| {
-                        let error = FlowError::Internal(format!(
-                            "invalid JS event sanitizer result: {error}"
-                        ));
-                        record_callback_error(error.to_string());
-                        error
+                        recorded_internal(format!("invalid JS event sanitizer result: {error}"))
                     })?;
                 Ok(CoreEventSanitizeFields {
                     data: fields.data,
@@ -581,26 +529,20 @@ pub fn wrap_js_event_metadata_injector_promise_fn(
             let event_json = JsEvent::try_from_event(&event)
                 .map(JsEvent::into_json)
                 .map_err(|error| {
-                    let error = FlowError::Internal(format!(
+                    recorded_internal(format!(
                         "failed to serialize JavaScript event metadata injector context: {error}"
-                    ));
-                    record_callback_error(error.to_string());
-                    error
+                    ))
                 })?;
             let publication =
                 nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
-            let value = if publication {
-                func.call_spread_for_publication(vec![event_json]).await
-            } else {
-                func.call(event_json).await
-            }
-            .inspect_err(|error| record_callback_error(error.to_string()))?;
+            let value = func
+                .call_spread(vec![event_json], publication)
+                .await
+                .inspect_err(|error| record_callback_error(error.to_string()))?;
             serde_json::from_value::<BTreeMap<String, Json>>(value).map_err(|error| {
-                let error = FlowError::Internal(format!(
+                recorded_internal(format!(
                     "invalid JavaScript event metadata injector result: {error}"
-                ));
-                record_callback_error(error.to_string());
-                error
+                ))
             })
         })
     }))
@@ -867,14 +809,22 @@ impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args>
         let pending = CompletionSlot::default();
         let complete = completion_function(env, completion_name, &pending, error_prefix)?;
         let queued_complete = Arc::clone(&complete);
-        // An abandoned stream must not keep the Node event loop alive.
+        let queued_pending = Arc::clone(&pending);
         let tsfn = wrapper
             .build_threadsafe_function::<T>()
             .weak::<true>()
             .build_callback(move |ctx: ThreadsafeCallContext<T>| {
-                let complete = queued_complete.function()?;
-                let complete = detach(&ctx.env, &complete);
-                args(&ctx.env, ctx.value, complete, js_value(&ctx.env, false)?)
+                let built = queued_complete.function().and_then(|complete| {
+                    let complete = detach(&ctx.env, &complete);
+                    args(&ctx.env, ctx.value, complete, js_value(&ctx.env, false)?)
+                });
+                if let Err(error) = &built
+                    && let Some(sender) = lock(&queued_pending).take()
+                {
+                    let _ =
+                        sender.send(Err(FlowError::Internal(format!("{error_prefix}: {error}"))));
+                }
+                built
             })?;
         Ok(Self {
             tsfn,

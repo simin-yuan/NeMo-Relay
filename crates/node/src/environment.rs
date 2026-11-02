@@ -220,7 +220,6 @@ impl PendingPromise {
         let Some(deferred) = self.deferred.take() else {
             return;
         };
-        // A closing settler means the environment is tearing down and the promise is gone.
         let status = self.settler.call(
             Settlement {
                 deferred,
