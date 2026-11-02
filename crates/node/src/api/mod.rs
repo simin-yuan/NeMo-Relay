@@ -4401,7 +4401,6 @@ impl AtofExporter {
 
 /// Mutable configuration object for `OpenTelemetrySubscriber`.
 #[napi(object)]
-#[derive(Default)]
 pub struct OpenTelemetryConfig {
     /// `"full"`, `"gen_ai"`, or `"openinference"`.
     #[napi(ts_type = "\"full\" | \"gen_ai\" | \"openinference\"")]
@@ -4448,7 +4447,6 @@ pub struct OpenTelemetryConfig {
 
 /// Paths to PEM certificate and private key files for one OTLP endpoint.
 #[napi(object)]
-#[derive(Default)]
 pub struct OpenTelemetryTlsConfig {
     /// CA bundle that replaces the system's trusted CAs.
     pub certificate: Option<String>,
@@ -4473,7 +4471,6 @@ impl From<OpenTelemetryTlsConfig> for nemo_relay_observability::OpenTelemetryTls
 /// Carries no endpoint, transport, headers, or timeout: a file destination has
 /// no use for them.
 #[napi(object)]
-#[derive(Default)]
 pub struct OpenTelemetryFileSinkConfig {
     /// `"full"`, `"gen_ai"`, or `"openinference"`.
     #[napi(ts_type = "\"full\" | \"gen_ai\" | \"openinference\"")]
@@ -4634,7 +4631,6 @@ impl OpenTelemetrySubscriber {
 
 /// Configuration object for `OpenTelemetryLogSubscriber`.
 #[napi(object)]
-#[derive(Default)]
 pub struct OpenTelemetryLogConfig {
     /// OTLP endpoint. Bare HTTP origins append `/v1/logs`.
     pub endpoint: String,
@@ -4731,7 +4727,6 @@ impl OpenTelemetryLogSubscriber {
 
 /// Configuration object for `OpenTelemetryMetricSubscriber`.
 #[napi(object)]
-#[derive(Default)]
 pub struct OpenTelemetryMetricConfig {
     /// OTLP endpoint. Bare HTTP origins append `/v1/metrics`.
     pub endpoint: String,
@@ -4823,7 +4818,7 @@ impl OpenTelemetryMetricSubscriber {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheTelemetryOptions {
     provider: String,
@@ -4845,7 +4840,7 @@ struct CacheTelemetryOptions {
     timestamp: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheRequestFactsOptions {
     provider: String,

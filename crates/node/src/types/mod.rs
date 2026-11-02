@@ -534,7 +534,7 @@ impl LlmRequest {
 
 /// Observability fields returned by mark and scope event sanitizers.
 #[napi(object)]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventSanitizeFields {
     pub data: Option<Json>,
@@ -564,8 +564,6 @@ pub(crate) fn event_sanitize_fields_from_json(
 // ---------------------------------------------------------------------------
 
 /// A read-only ATOF lifecycle event delivered to subscribers.
-#[derive(Serialize)]
-#[serde(transparent)]
 pub struct JsEvent(serde_json::Value);
 
 impl JsEvent {

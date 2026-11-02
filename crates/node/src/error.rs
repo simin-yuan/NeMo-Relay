@@ -89,12 +89,6 @@ pub(crate) fn throw(env: &Env, error: napi::Error) -> napi::Error {
     }
 }
 
-impl From<Error> for napi::Error {
-    fn from(error: Error) -> Self {
-        error.to_napi()
-    }
-}
-
 impl From<Error> for JsError {
     fn from(error: Error) -> Self {
         Self::from(error.to_napi())

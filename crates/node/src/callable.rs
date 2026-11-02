@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::type_complexity)]
 //! JavaScript callable wrappers for NeMo Relay callbacks.
 //!
 //! Bridges JavaScript `Function` values into the closure signatures the core runtime
@@ -95,28 +94,25 @@ pub(crate) fn flush_js_subscriber_callbacks() {
 
 /// Structured codec identity delivered to JavaScript LLM sanitizers.
 #[napi(object)]
-#[derive(Clone)]
 pub(crate) struct JsLlmCodecIdentity {
     pub kind: String,
     pub id: Option<String>,
 }
 
 /// Structured per-call request context delivered to JavaScript LLM sanitizers.
-#[derive(Clone)]
 pub(crate) struct JsLlmSanitizeRequestContext {
     pub codec: JsLlmCodecIdentity,
     resolved: Option<Arc<dyn LlmCodec>>,
 }
 
 /// Structured per-call response context delivered to JavaScript LLM sanitizers.
-#[derive(Clone)]
 pub(crate) struct JsLlmSanitizeResponseContext {
     pub codec: JsLlmCodecIdentity,
     resolved: Option<Arc<dyn LlmResponseCodec>>,
 }
 
 /// JavaScript-facing pending mark DTO.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct JsPendingMarkSpec {
     name: String,
