@@ -21,7 +21,7 @@ fn bounded_query(query: Option<JsString>) -> Result<String> {
     Ok(query.into_utf8()?.as_str()?.to_owned())
 }
 fn camel_case(key: &str) -> String {
-    let mut result = String::new();
+    let mut result = String::with_capacity(key.len());
     let mut uppercase = false;
     for ch in key.chars() {
         if ch == '_' {

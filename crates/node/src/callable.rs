@@ -4,9 +4,8 @@
 #![allow(clippy::type_complexity)]
 //! JavaScript callable wrappers for NeMo Relay callbacks.
 //!
-//! This module bridges JavaScript functions (received as NAPI `ThreadsafeFunction` values)
-//! into the Rust closure signatures expected by the NeMo Relay core runtime. Each wrapper
-//! handles serialization of arguments to/from JSON and manages cross-thread communication
+//! Bridges JavaScript `Function` values into the closure signatures the core runtime
+//! expects. Wrappers serialize arguments to and from JSON and carry calls and results
 //! between the Rust async runtime and the Node.js event loop.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,7 +48,7 @@ use nemo_relay_types::error::{FlowError, Result};
 use crate::callback_factory;
 use crate::convert::{
     HandledTsfn, JsArg, JsArgs2, JsArgs3, PersistentJsFunction, Tsfn, abort_tsfn, closure_function,
-    detach, js_value, lock, record_callback_error,
+    detach, js_value, lock, record_callback_error, report_queue_status,
 };
 use crate::environment::teardown_flag;
 use crate::error::Error;
@@ -633,35 +632,6 @@ pub(crate) fn recv_callback_result(
     received?
 }
 
-/// Wrap a JS function `(name: string, args: object) => object` for tool sanitize/intercept.
-pub fn wrap_js_tool_fn(func: Tsfn<(String, Json), JsArgs2, JsArg>) -> ToolSanitizeFn {
-    let func = Arc::new(func);
-    Arc::new(move |name: String, args: Json| {
-        let func = func.clone();
-        Box::pin(async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let status = func.call_with_return_value(
-                (name, args),
-                ThreadsafeFunctionCallMode::NonBlocking,
-                move |value: napi::Result<JsArg>, env| {
-                    let _ = tx.send(tsfn_envelope(
-                        &env,
-                        value,
-                        "nemo_relay: JS tool callback failed",
-                    ));
-                    Ok(())
-                },
-            );
-            if status != napi::Status::Ok {
-                return Err(FlowError::Internal(format!(
-                    "failed to queue JS tool callback: {status:?}"
-                )));
-            }
-            await_callback_result(rx, "nemo_relay: JS tool callback failed").await
-        })
-    })
-}
-
 pub(crate) fn parse_tool_execution_result(value: Json) -> Result<ToolExecutionResult> {
     serde_json::from_value(value).map_err(|error| {
         FlowError::InvalidArgument(format!(
@@ -1102,9 +1072,10 @@ pub fn wrap_js_event_subscriber(
             ThreadsafeFunctionCallMode::NonBlocking,
         );
         if status != napi::Status::Ok {
-            record_callback_error(format!(
-                "nemo_relay: failed to queue JS event subscriber '{queue_error_name}' callback: {status:?}"
-            ));
+            report_queue_status(
+                status,
+                &format!("JS event subscriber '{queue_error_name}' callback"),
+            );
             complete_js_subscriber_callback(callback_id);
         }
     }))

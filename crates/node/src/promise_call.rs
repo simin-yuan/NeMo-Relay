@@ -896,9 +896,9 @@ impl PromiseAwareFn {
                     spread: mode.spread,
                     next,
                     publication: mode.publication,
-                    publication_context_id: publication_callback_context_id(),
                     // Queued tool and LLM sanitizers use the publication context to avoid
                     // waiting on their own publication.
+                    publication_context_id: publication_callback_context_id(),
                     scope: CallbackScope::capture(),
                     stream_result: false,
                 },

@@ -249,8 +249,9 @@ fn checked_json_within(env: &Env, value: Unknown, remaining_depth: u32) -> Resul
             };
             let object = Object::from_unknown(value)?;
             if object.is_array()? {
-                let mut values = Vec::new();
-                for index in 0..object.get_array_length()? {
+                let length = object.get_array_length()?;
+                let mut values = Vec::with_capacity(length as usize);
+                for index in 0..length {
                     values.push(checked_json_within(
                         env,
                         object.get_element(index)?,
@@ -259,8 +260,9 @@ fn checked_json_within(env: &Env, value: Unknown, remaining_depth: u32) -> Resul
                 }
                 Ok(Json::Array(values))
             } else {
-                let mut values = serde_json::Map::new();
-                for key in Object::keys(&object)? {
+                let keys = Object::keys(&object)?;
+                let mut values = serde_json::Map::with_capacity(keys.len());
+                for key in keys {
                     if let Some(value) = object.get::<Unknown>(&key)? {
                         values.insert(key, checked_json_within(env, value, remaining_depth)?);
                     }

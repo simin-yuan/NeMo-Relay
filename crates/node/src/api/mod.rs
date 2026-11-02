@@ -87,7 +87,7 @@ pub(crate) const LLM_STREAM_BRIDGE_CAPACITY: usize = 32;
 use crate::callable;
 use crate::callback_factory::{self, CallbackScope};
 use crate::convert::{
-    Callback, JAVASCRIPT_MAX_SAFE_INTEGER, JsArg, JsArgs2, Tsfn, abort_tsfn,
+    Callback, JAVASCRIPT_MAX_SAFE_INTEGER, JsArg, JsArgs2, Tsfn,
     clear_last_callback_error as clear_recorded_callback_error, closure_function, detach,
     get_last_callback_error as get_recorded_callback_error, js_value, lock, opt_json,
     parse_timestamp_micros, record_callback_error,
@@ -1128,34 +1128,6 @@ fn scoped_llm_execution_fn(func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>) -> LlmExe
     })
 }
 
-fn middleware_tool_callback_tsfn(
-    env: &Env,
-    func: &Function<JsArg, JsArg>,
-) -> Result<Tsfn<(String, Json), JsArgs2, JsArg>> {
-    let callback: Function<JsArgs2, JsArg> = callback_factory::wrap_middleware_callback(env, func)?;
-    let tsfn = callback
-        .build_threadsafe_function::<(String, Json)>()
-        .weak::<true>()
-        .build_callback(|ctx: ThreadsafeCallContext<(String, Json)>| {
-            let name = ctx.env.create_string_from_std(ctx.value.0)?;
-            let args = js_value(&ctx.env, ctx.value.1)?;
-            Ok(FnArgs::from((detach(&ctx.env, &name), args)))
-        })?;
-    Ok(tsfn)
-}
-
-fn middleware_json_callback_tsfn(
-    env: &Env,
-    func: &Function<JsArg, JsArg>,
-) -> Result<Tsfn<Json, Json, JsArg>> {
-    let callback: Function<Json, JsArg> = callback_factory::wrap_middleware_callback(env, func)?;
-    let tsfn = callback
-        .build_threadsafe_function::<Json>()
-        .weak::<true>()
-        .build_callback(|ctx: ThreadsafeCallContext<Json>| Ok(ctx.value))?;
-    Ok(tsfn)
-}
-
 type PluginRegistrations = Arc<StdMutex<Vec<PluginRegistration>>>;
 
 fn push_plugin_registration(
@@ -1871,64 +1843,6 @@ pub fn clear_last_callback_error() {
     clear_recorded_callback_error();
 }
 
-/// Internal test helper: invoke a closed JS tool callback wrapper and return the fallback value.
-#[napi(js_name = "__testClosedToolCallback", catch_unwind)]
-pub fn test_closed_tool_callback<'env>(
-    env: &'env Env,
-    #[napi(ts_arg_type = "(arg0: string, arg1: Json) => any")] callback: Callback,
-    name: String,
-    args: Json,
-) -> Result<PromiseRaw<'env, Json>> {
-    clear_recorded_callback_error();
-    let tsfn = middleware_tool_callback_tsfn(env, &callback)?;
-    abort_tsfn(&tsfn)?;
-    let wrapped = callable::wrap_js_tool_fn(tsfn);
-    let fallback = args.clone();
-    spawn_promise::<_, _, Error, _, _>(
-        env,
-        async move {
-            match wrapped(name, args).await {
-                Ok(value) => Ok(value),
-                Err(error) => {
-                    record_callback_error(error.to_string());
-                    Ok(fallback)
-                }
-            }
-        },
-        js_value,
-    )
-}
-
-/// Internal test helper: model a closed JS LLM request sanitizer.
-#[napi(js_name = "__testClosedLlmSanitizeRequestCallback", catch_unwind)]
-pub fn test_closed_llm_sanitize_request_callback(
-    env: &Env,
-    #[napi(ts_arg_type = "(arg: Json) => any")] callback: Callback,
-    request: Json,
-) -> Result<Option<Json>> {
-    clear_recorded_callback_error();
-    abort_tsfn(&middleware_json_callback_tsfn(env, &callback)?)?;
-    let llm_request: LlmRequest = serde_json::from_value(request)
-        .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-    drop(llm_request);
-    record_callback_error("nemo_relay: failed to queue JS LLM sanitize request callback");
-    Ok(None)
-}
-
-/// Internal test helper: model a closed JS LLM response sanitizer.
-#[napi(js_name = "__testClosedLlmResponseCallback", catch_unwind)]
-pub fn test_closed_llm_response_callback(
-    env: &Env,
-    #[napi(ts_arg_type = "(arg: Json) => any")] callback: Callback,
-    response: Json,
-) -> Result<Option<Json>> {
-    clear_recorded_callback_error();
-    abort_tsfn(&middleware_json_callback_tsfn(env, &callback)?)?;
-    drop(response);
-    record_callback_error("nemo_relay: failed to queue JS LLM sanitize response callback");
-    Ok(None)
-}
-
 /// Resolve a stream callback future whose queue step already failed.
 fn settled_now<T>(mut future: Pin<Box<dyn Future<Output = T> + Send>>) -> Result<T> {
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -2154,7 +2068,7 @@ pub fn with_scope<'env>(
     .map_err(Error::from)?;
     let scope_uuid = scope_handle.uuid;
 
-    // Hand the callback a real `ScopeHandle` instance, matching the Rust,
+    // Hand the callback a real `ScopeHandle` instance, matching the Rust and
     // Python bindings, so it can be passed back into `event`,
     // `toolCallExecute`, and `llmCallExecute`. The instance is materialized on
     // the JS thread because a `napi_wrap`'d handle cannot cross the
@@ -2419,15 +2333,10 @@ pub fn tool_call_execute<'env>(
     )
 }
 
-/// Execute a tool call end-to-end, supporting both sync and async (Promise-returning) callbacks.
+/// Execute a tool call end-to-end with a callback that returns a value or a Promise.
 ///
-/// Same lifecycle as `toolCallExecute` (guardrails → intercepts → func → response processing),
-/// but transparently handles JS callbacks that return Promises. Uses `napi_is_promise` to detect
-/// Promise return values and resolves them before continuing the pipeline.
-/// An optional trailing `toolCallId` is recorded in both lifecycle events.
-///
-/// Accepts a raw `Function` instead of `ThreadsafeFunction` so it can create a
-/// promise-aware wrapper with access to `Env`.
+/// Runs the same lifecycle as `toolCallExecute`. An optional trailing `toolCallId` is
+/// recorded in both lifecycle events.
 #[allow(clippy::too_many_arguments)]
 #[napi(ts_return_type = "Promise<ToolExecutionResult>", catch_unwind)]
 pub fn tool_call_execute_async<'env>(
@@ -2659,11 +2568,10 @@ pub fn llm_call_execute<'env>(
     )
 }
 
-/// Execute an LLM call end-to-end, supporting both sync and async (Promise-returning) callbacks.
+/// Execute an LLM call end-to-end with a callback that returns a value or a Promise.
 ///
-/// Same lifecycle as `llmCallExecute` (guardrails → intercepts → func → response processing),
-/// but transparently handles JS callbacks that return Promises.
-/// Supply `codecDecode` and `codecEncode` together or omit both.
+/// Runs the same lifecycle as `llmCallExecute`. Supply `codecDecode` and `codecEncode`
+/// together or omit both.
 #[allow(clippy::too_many_arguments)]
 #[napi(ts_return_type = "Promise<unknown>", catch_unwind)]
 pub fn llm_call_execute_async<'env>(
@@ -4998,11 +4906,8 @@ impl AdaptiveRuntime {
 
     /// Register all configured adaptive runtime features.
     ///
-    /// `register()` and `shutdown()` both temporarily take ownership of the
-    /// runtime state, so concurrent calls are mutually exclusive by design.
-    /// Once either operation takes the state, another concurrent registration or
-    /// shutdown attempt fails with "adaptive runtime already shut down". This
-    /// prevents double-registration and shutdown-during-registration races.
+    /// A `register()` or `shutdown()` call that overlaps another fails with
+    /// "adaptive runtime already shut down".
     #[napi(ts_return_type = "Promise<void>", catch_unwind)]
     pub fn register<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
         let inner = self.inner.clone();

@@ -11,10 +11,7 @@ const lib = require('../index.js');
 const {
   __testClosedCollectorCallback,
   __testClosedFinalizerCallback,
-  __testClosedLlmResponseCallback,
-  __testClosedLlmSanitizeRequestCallback,
   __testClosedPromiseAwareCall,
-  __testClosedToolCallback,
   clearLastCallbackError,
   deregisterLlmSanitizeRequestGuardrail,
   flushSubscribers,
@@ -66,50 +63,6 @@ describe('callback error helpers', () => {
       deregisterLlmSanitizeRequestGuardrail('node_llm_san_req_public_error');
       clearLastCallbackError();
     }
-  });
-
-  it('closed tool sanitize callbacks preserve the original payload and record the queue failure', async () => {
-    const args = {
-      value: 1,
-    };
-    const result = await __testClosedToolCallback(
-      () => ({
-        ok: true,
-      }),
-      'closed_tool',
-      args,
-    );
-    assert.deepEqual(result, args);
-    assert.match(getLastCallbackError() ?? '', /failed to queue JS tool callback/i);
-    clearLastCallbackError();
-  });
-
-  it('closed llm sanitize-request callbacks omit the payload and record the queue failure', () => {
-    const request = makeNative();
-    const result = __testClosedLlmSanitizeRequestCallback(
-      () => ({
-        broken: true,
-      }),
-      request,
-    );
-    assert.equal(result, null);
-    assert.match(getLastCallbackError() ?? '', /failed to queue JS LLM sanitize request callback/i);
-    clearLastCallbackError();
-  });
-
-  it('closed llm sanitize-response callbacks omit the payload and record the queue failure', () => {
-    const response = {
-      ok: true,
-    };
-    const result = __testClosedLlmResponseCallback(
-      () => ({
-        rewritten: true,
-      }),
-      response,
-    );
-    assert.equal(result, null);
-    assert.match(getLastCallbackError() ?? '', /failed to queue JS LLM sanitize response callback/i);
-    clearLastCallbackError();
   });
 
   it('closed collector callbacks surface the queue failure and record it', async () => {

@@ -210,7 +210,7 @@
     callId,
     arg0,
     spread,
-    next,
+    nextState,
     publication,
     publicationContextId,
     scope,
@@ -275,9 +275,9 @@
       { once: true },
     );
     const invokeNext = (value) =>
-      settle.next(next, jsonValue(value === undefined ? null : value), eventSanitizerContext.getStore()?.scope);
+      settle.next(nextState, jsonValue(value === undefined ? null : value), eventSanitizerContext.getStore()?.scope);
     const safeNext =
-      next === undefined
+      nextState === undefined
         ? undefined
         : !streamResult
           ? invokeNext
@@ -508,7 +508,7 @@
         callId,
         arg0,
         spread,
-        next,
+        nextState,
         publication,
         publicationContextId,
         scope,
@@ -529,7 +529,7 @@
           callId,
           arg0,
           spread,
-          next,
+          nextState,
           publication,
           publicationContextId,
           scope,

@@ -546,17 +546,17 @@ pub(crate) fn event_sanitize_fields_from_json(
     value: Json,
 ) -> serde_json::Result<EventSanitizeFields> {
     let Some(object) = value.as_object() else {
-        return Err(serde_json::Error::io(std::io::Error::other(
+        return Err(serde::de::Error::custom(
             "event sanitizer must return an object",
-        )));
+        ));
     };
     if !["data", "categoryProfile", "metadata"]
         .iter()
         .any(|field| object.contains_key(*field))
     {
-        return Err(serde_json::Error::io(std::io::Error::other(
+        return Err(serde::de::Error::custom(
             "event sanitizer must return at least one sanitizer field",
-        )));
+        ));
     }
     serde_json::from_value(value)
 }
