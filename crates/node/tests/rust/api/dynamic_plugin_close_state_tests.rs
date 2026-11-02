@@ -10,10 +10,7 @@ async fn close_result_is_published_before_a_retry_can_reset_completion() {
         .expect("empty plugin host must initialize");
     let state = Arc::new(DynamicPluginCloseState::new(activation));
     let activation = {
-        let mut status = state
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut status = lock(&state.status);
         let activation = match &mut *status {
             DynamicPluginCloseStatus::Active(activation) => {
                 activation.take().expect("activation must be owned")
@@ -53,10 +50,7 @@ async fn close_result_is_published_before_a_retry_can_reset_completion() {
     finish.join().expect("finish thread must not panic");
 
     let mut activation = {
-        let mut status = state
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut status = lock(&state.status);
         let activation = match &mut *status {
             DynamicPluginCloseStatus::Active(activation) => activation
                 .take()

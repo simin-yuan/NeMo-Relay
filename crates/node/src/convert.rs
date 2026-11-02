@@ -6,7 +6,7 @@
 //! Provides helpers to convert errors and optional JSON values between the core
 //! runtime representation and the NAPI binding layer.
 
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
 use napi::bindgen_prelude::{
@@ -101,6 +101,14 @@ pub(crate) type Tsfn<T, Args = T, Return = ()> =
 pub(crate) type HandledTsfn<T, Args = T, Return = ()> =
     ThreadsafeFunction<T, Return, Args, Status, true, true>;
 
+pub(crate) const JAVASCRIPT_MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+const MAX_JSON_DEPTH: u32 = 128;
+
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// JavaScript function kept alive for later direct calls on the creating thread.
 pub(crate) struct PersistentJsFunction<Args: JsValuesTupleIntoVec, Return> {
     env: Env,
@@ -185,30 +193,29 @@ where
     })
 }
 
+pub(crate) fn report_queue_status(status: Status, call: &str) {
+    if status != Status::Ok && status != Status::Closing {
+        record_callback_error(format!("nemo_relay: failed to queue {call}: {status:?}"));
+    }
+}
+
 static LAST_CALLBACK_ERROR: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Record the most recent callback error observed inside the Node binding.
 pub fn record_callback_error(message: impl Into<String>) {
     let message = message.into();
     eprintln!("{message}");
-    if let Ok(mut guard) = LAST_CALLBACK_ERROR.lock() {
-        *guard = Some(message);
-    }
+    *lock(&LAST_CALLBACK_ERROR) = Some(message);
 }
 
 /// Read the most recent callback error observed inside the Node binding.
 pub fn get_last_callback_error() -> Option<String> {
-    LAST_CALLBACK_ERROR
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
+    lock(&LAST_CALLBACK_ERROR).clone()
 }
 
 /// Clear the most recent callback error observed inside the Node binding.
 pub fn clear_last_callback_error() {
-    if let Ok(mut guard) = LAST_CALLBACK_ERROR.lock() {
-        *guard = None;
-    }
+    *lock(&LAST_CALLBACK_ERROR) = None;
 }
 
 /// Filter an optional JSON value, converting explicit `null` values to `None`.
@@ -222,6 +229,10 @@ pub fn opt_json(val: Option<Json>) -> Option<Json> {
 /// Convert JSON input. Throw a TypeError for a BigInt instead of coercing it.
 /// Read properties once so getters cannot bypass the BigInt check.
 pub(crate) fn checked_json(env: &Env, value: Unknown) -> Result<Json> {
+    checked_json_within(env, value, MAX_JSON_DEPTH)
+}
+
+fn checked_json_within(env: &Env, value: Unknown, remaining_depth: u32) -> Result<Json> {
     match value.get_type()? {
         ValueType::BigInt => {
             env.throw_type_error("BigInt cannot be represented as JSON", None)?;
@@ -231,18 +242,27 @@ pub(crate) fn checked_json(env: &Env, value: Unknown) -> Result<Json> {
             )))
         }
         ValueType::Object => {
+            let Some(remaining_depth) = remaining_depth.checked_sub(1) else {
+                return Err(Error::invalid_argument(
+                    "Exceeded maximum JSON nesting depth",
+                ));
+            };
             let object = Object::from_unknown(value)?;
             if object.is_array()? {
                 let mut values = Vec::new();
                 for index in 0..object.get_array_length()? {
-                    values.push(checked_json(env, object.get_element(index)?)?);
+                    values.push(checked_json_within(
+                        env,
+                        object.get_element(index)?,
+                        remaining_depth,
+                    )?);
                 }
                 Ok(Json::Array(values))
             } else {
                 let mut values = serde_json::Map::new();
                 for key in Object::keys(&object)? {
                     if let Some(value) = object.get::<Unknown>(&key)? {
-                        values.insert(key, checked_json(env, value)?);
+                        values.insert(key, checked_json_within(env, value, remaining_depth)?);
                     }
                 }
                 Ok(Json::Object(values))
@@ -254,12 +274,11 @@ pub(crate) fn checked_json(env: &Env, value: Unknown) -> Result<Json> {
 
 /// Parse optional Unix microseconds since epoch into a UTC timestamp.
 pub fn parse_timestamp_micros(value: Option<f64>) -> Result<Option<DateTime<Utc>>> {
-    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
     value
         .map(|timestamp| {
             if !timestamp.is_finite()
                 || timestamp.fract() != 0.0
-                || timestamp.abs() > MAX_SAFE_INTEGER
+                || timestamp.abs() > JAVASCRIPT_MAX_SAFE_INTEGER as f64
             {
                 return Err(Error::invalid_argument(
                     "timestamp must be a safe integer number of Unix microseconds",

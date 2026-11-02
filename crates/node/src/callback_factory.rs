@@ -123,14 +123,19 @@ pub(crate) fn callback_scope_from(
     }
 }
 
+fn wrapper_function<'env, Args: JsValuesTupleIntoVec, Return>(
+    env: &'env Env,
+    wrapper: JsArg,
+) -> napi::Result<Function<'env, Args, Return>> {
+    Function::from_unknown(unsafe { wrapper.into_unknown(env) })
+}
+
 fn wrap<'env, Args: JsValuesTupleIntoVec, Return>(
     env: &'env Env,
     factory: &FunctionRef<JsArg, JsArg>,
     func: &Function<JsArg, JsArg>,
 ) -> napi::Result<Function<'env, Args, Return>> {
-    let wrapper = factory.borrow_back(env)?.call(detach(env, func))?;
-    // SAFETY: `wrapper` was returned by the factory call above, in `env`.
-    Function::from_unknown(unsafe { wrapper.into_unknown(env) })
+    wrapper_function(env, factory.borrow_back(env)?.call(detach(env, func))?)
 }
 
 /// Wrap an execution callback so a failure crosses N-API as an envelope.
@@ -175,8 +180,7 @@ pub(crate) fn wrap_subscriber_callback<'env, Args: JsValuesTupleIntoVec, Return>
         .subscriber
         .borrow_back(env)?
         .call(FnArgs::from((detach(env, func), detach(env, complete))))?;
-    // SAFETY: `wrapper` was returned by the factory call above, in `env`.
-    Function::from_unknown(unsafe { wrapper.into_unknown(env) })
+    wrapper_function(env, wrapper)
 }
 
 pub(crate) fn wrap_promise_callback<'env, Args: JsValuesTupleIntoVec, Return>(
@@ -197,8 +201,7 @@ pub(crate) fn wrap_promise_callback<'env, Args: JsValuesTupleIntoVec, Return>(
             stream_end,
             next,
         )))?;
-    // SAFETY: `wrapper` was returned by the factory call above, in `env`.
-    Function::from_unknown(unsafe { wrapper.into_unknown(env) })
+    wrapper_function(env, wrapper)
 }
 
 pub(crate) fn wrap_collector_callback<'env, Args: JsValuesTupleIntoVec, Return>(

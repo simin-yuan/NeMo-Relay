@@ -31,7 +31,7 @@ pub enum Error {
     #[error(transparent)]
     OtlpFile(#[from] OtlpFileExporterError),
     #[error("{}", .0.reason())]
-    Diagnostic(EmbeddedDiagnosticError),
+    Diagnostic(#[from] EmbeddedDiagnosticError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -86,12 +86,6 @@ pub(crate) fn throw(env: &Env, error: napi::Error) -> napi::Error {
     match env.throw(error) {
         Ok(()) => napi::Error::new(Status::PendingException, reason),
         Err(failure) => failure,
-    }
-}
-
-impl From<EmbeddedDiagnosticError> for Error {
-    fn from(error: EmbeddedDiagnosticError) -> Self {
-        Self::Diagnostic(error)
     }
 }
 

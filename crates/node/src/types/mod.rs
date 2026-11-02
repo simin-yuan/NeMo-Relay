@@ -575,14 +575,30 @@ impl JsEvent {
     }
 }
 
-impl From<&Event> for JsEvent {
-    fn from(e: &Event) -> Self {
-        Self::try_from_event(e).expect("serializing an ATOF event to JSON should not fail")
-    }
-}
 // ---------------------------------------------------------------------------
 // Built-in codec classes
 // ---------------------------------------------------------------------------
+
+fn decode_request(codec: &dyn LlmCodec, request: Json) -> Result<Json> {
+    let request: CoreLlmRequest = serde_json::from_value(request)
+        .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
+    let annotated = codec.decode(&request)?;
+    serde_json::to_value(&annotated).map_err(Error::from)
+}
+
+fn encode_request(codec: &dyn LlmCodec, annotated: Json, original: Json) -> Result<Json> {
+    let annotated: AnnotatedLlmRequest = serde_json::from_value(annotated)
+        .map_err(|e| Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {e}")))?;
+    let original: CoreLlmRequest = serde_json::from_value(original)
+        .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
+    let encoded = codec.encode(&annotated, &original)?;
+    serde_json::to_value(&encoded).map_err(Error::from)
+}
+
+fn decode_response(codec: &dyn LlmResponseCodec, response: &Json) -> Result<Json> {
+    let annotated = codec.decode_response(response)?;
+    serde_json::to_value(&annotated).map_err(Error::from)
+}
 
 /// Built-in codec for the OpenAI Chat Completions API.
 ///
@@ -590,8 +606,7 @@ impl From<&Event> for JsEvent {
 /// (decodeResponse). Construct with `new OpenAIChatCodec()`.
 #[napi(js_name = "OpenAIChatCodec")]
 pub struct OpenAIChatCodec {
-    pub(crate) inner_codec: std::sync::Arc<dyn LlmCodec>,
-    pub(crate) inner_response_codec: std::sync::Arc<dyn LlmResponseCodec>,
+    codec: nemo_relay::codec::openai_chat::OpenAIChatCodec,
 }
 
 #[napi]
@@ -599,41 +614,26 @@ impl OpenAIChatCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            inner_codec: std::sync::Arc::new(nemo_relay::codec::openai_chat::OpenAIChatCodec),
-            inner_response_codec: std::sync::Arc::new(
-                nemo_relay::codec::openai_chat::OpenAIChatCodec,
-            ),
+            codec: nemo_relay::codec::openai_chat::OpenAIChatCodec,
         }
     }
 
     /// Decode an opaque LLM request into structured form.
     #[napi(catch_unwind)]
     pub fn decode(&self, request: Json) -> Result<Json> {
-        let llm_req: CoreLlmRequest = serde_json::from_value(request)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let annotated = self.inner_codec.decode(&llm_req).map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_request(&self.codec, request)
     }
 
     /// Encode structured changes back into an opaque LLM request.
     #[napi(catch_unwind)]
     pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        let ann: AnnotatedLlmRequest = serde_json::from_value(annotated)
-            .map_err(|e| Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {e}")))?;
-        let orig: CoreLlmRequest = serde_json::from_value(original)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let result = self.inner_codec.encode(&ann, &orig).map_err(Error::from)?;
-        serde_json::to_value(&result).map_err(Error::from)
+        encode_request(&self.codec, annotated, original)
     }
 
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        let annotated = self
-            .inner_response_codec
-            .decode_response(&response)
-            .map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_response(&self.codec, &response)
     }
 }
 
@@ -643,8 +643,7 @@ impl OpenAIChatCodec {
 /// (decodeResponse). Construct with `new OpenAIResponsesCodec()`.
 #[napi(js_name = "OpenAIResponsesCodec")]
 pub struct OpenAIResponsesCodec {
-    pub(crate) inner_codec: std::sync::Arc<dyn LlmCodec>,
-    pub(crate) inner_response_codec: std::sync::Arc<dyn LlmResponseCodec>,
+    codec: nemo_relay::codec::openai_responses::OpenAIResponsesCodec,
 }
 
 #[napi]
@@ -652,43 +651,26 @@ impl OpenAIResponsesCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            inner_codec: std::sync::Arc::new(
-                nemo_relay::codec::openai_responses::OpenAIResponsesCodec,
-            ),
-            inner_response_codec: std::sync::Arc::new(
-                nemo_relay::codec::openai_responses::OpenAIResponsesCodec,
-            ),
+            codec: nemo_relay::codec::openai_responses::OpenAIResponsesCodec,
         }
     }
 
     /// Decode an opaque LLM request into structured form.
     #[napi(catch_unwind)]
     pub fn decode(&self, request: Json) -> Result<Json> {
-        let llm_req: CoreLlmRequest = serde_json::from_value(request)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let annotated = self.inner_codec.decode(&llm_req).map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_request(&self.codec, request)
     }
 
     /// Encode structured changes back into an opaque LLM request.
     #[napi(catch_unwind)]
     pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        let ann: AnnotatedLlmRequest = serde_json::from_value(annotated)
-            .map_err(|e| Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {e}")))?;
-        let orig: CoreLlmRequest = serde_json::from_value(original)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let result = self.inner_codec.encode(&ann, &orig).map_err(Error::from)?;
-        serde_json::to_value(&result).map_err(Error::from)
+        encode_request(&self.codec, annotated, original)
     }
 
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        let annotated = self
-            .inner_response_codec
-            .decode_response(&response)
-            .map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_response(&self.codec, &response)
     }
 }
 
@@ -698,8 +680,7 @@ impl OpenAIResponsesCodec {
 /// (decodeResponse). Construct with `new GeminiGenerateContentCodec()`.
 #[napi(js_name = "GeminiGenerateContentCodec")]
 pub struct GeminiGenerateContentCodec {
-    pub(crate) inner_codec: std::sync::Arc<dyn LlmCodec>,
-    pub(crate) inner_response_codec: std::sync::Arc<dyn LlmResponseCodec>,
+    codec: nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
 }
 
 #[napi]
@@ -707,33 +688,20 @@ impl GeminiGenerateContentCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            inner_codec: std::sync::Arc::new(
-                nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
-            ),
-            inner_response_codec: std::sync::Arc::new(
-                nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
-            ),
+            codec: nemo_relay::codec::gemini_generate_content::GeminiGenerateContentCodec,
         }
     }
 
     /// Decode an opaque LLM request into structured form.
     #[napi(catch_unwind)]
     pub fn decode(&self, request: Json) -> Result<Json> {
-        let llm_req: CoreLlmRequest = serde_json::from_value(request)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let annotated = self.inner_codec.decode(&llm_req).map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_request(&self.codec, request)
     }
 
     /// Encode structured changes back into an opaque LLM request.
     #[napi(catch_unwind)]
     pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        let ann: AnnotatedLlmRequest = serde_json::from_value(annotated)
-            .map_err(|e| Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {e}")))?;
-        let orig: CoreLlmRequest = serde_json::from_value(original)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let result = self.inner_codec.encode(&ann, &orig).map_err(Error::from)?;
-        serde_json::to_value(&result).map_err(Error::from)
+        encode_request(&self.codec, annotated, original)
     }
 
     /// Decode a raw LLM response into structured form.
@@ -744,12 +712,7 @@ impl GeminiGenerateContentCodec {
         env: Env,
         #[napi(ts_arg_type = "any")] response: Unknown,
     ) -> Result<Json> {
-        let response = crate::convert::checked_json(&env, response)?;
-        let annotated = self
-            .inner_response_codec
-            .decode_response(&response)
-            .map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_response(&self.codec, &crate::convert::checked_json(&env, response)?)
     }
 }
 
@@ -759,8 +722,7 @@ impl GeminiGenerateContentCodec {
 /// (decodeResponse). Construct with `new AnthropicMessagesCodec()`.
 #[napi]
 pub struct AnthropicMessagesCodec {
-    pub(crate) inner_codec: std::sync::Arc<dyn LlmCodec>,
-    pub(crate) inner_response_codec: std::sync::Arc<dyn LlmResponseCodec>,
+    codec: nemo_relay::codec::anthropic::AnthropicMessagesCodec,
 }
 
 #[napi]
@@ -768,41 +730,26 @@ impl AnthropicMessagesCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            inner_codec: std::sync::Arc::new(nemo_relay::codec::anthropic::AnthropicMessagesCodec),
-            inner_response_codec: std::sync::Arc::new(
-                nemo_relay::codec::anthropic::AnthropicMessagesCodec,
-            ),
+            codec: nemo_relay::codec::anthropic::AnthropicMessagesCodec,
         }
     }
 
     /// Decode an opaque LLM request into structured form.
     #[napi(catch_unwind)]
     pub fn decode(&self, request: Json) -> Result<Json> {
-        let llm_req: CoreLlmRequest = serde_json::from_value(request)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let annotated = self.inner_codec.decode(&llm_req).map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_request(&self.codec, request)
     }
 
     /// Encode structured changes back into an opaque LLM request.
     #[napi(catch_unwind)]
     pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        let ann: AnnotatedLlmRequest = serde_json::from_value(annotated)
-            .map_err(|e| Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {e}")))?;
-        let orig: CoreLlmRequest = serde_json::from_value(original)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let result = self.inner_codec.encode(&ann, &orig).map_err(Error::from)?;
-        serde_json::to_value(&result).map_err(Error::from)
+        encode_request(&self.codec, annotated, original)
     }
 
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        let annotated = self
-            .inner_response_codec
-            .decode_response(&response)
-            .map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_response(&self.codec, &response)
     }
 }
 
@@ -812,8 +759,7 @@ impl AnthropicMessagesCodec {
 /// (decodeResponse). Construct with `new OCIGenAIChatCodec()`.
 #[napi(js_name = "OCIGenAIChatCodec")]
 pub struct OCIGenAIChatCodec {
-    pub(crate) inner_codec: std::sync::Arc<dyn LlmCodec>,
-    pub(crate) inner_response_codec: std::sync::Arc<dyn LlmResponseCodec>,
+    codec: nemo_relay::codec::oci_genai::OCIGenAIChatCodec,
 }
 
 #[napi]
@@ -821,40 +767,25 @@ impl OCIGenAIChatCodec {
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
-            inner_codec: std::sync::Arc::new(nemo_relay::codec::oci_genai::OCIGenAIChatCodec),
-            inner_response_codec: std::sync::Arc::new(
-                nemo_relay::codec::oci_genai::OCIGenAIChatCodec,
-            ),
+            codec: nemo_relay::codec::oci_genai::OCIGenAIChatCodec,
         }
     }
 
     /// Decode an opaque LLM request into structured form.
     #[napi(catch_unwind)]
     pub fn decode(&self, request: Json) -> Result<Json> {
-        let llm_req: CoreLlmRequest = serde_json::from_value(request)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let annotated = self.inner_codec.decode(&llm_req).map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_request(&self.codec, request)
     }
 
     /// Encode structured changes back into an opaque LLM request.
     #[napi(catch_unwind)]
     pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        let ann: AnnotatedLlmRequest = serde_json::from_value(annotated)
-            .map_err(|e| Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {e}")))?;
-        let orig: CoreLlmRequest = serde_json::from_value(original)
-            .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-        let result = self.inner_codec.encode(&ann, &orig).map_err(Error::from)?;
-        serde_json::to_value(&result).map_err(Error::from)
+        encode_request(&self.codec, annotated, original)
     }
 
     /// Decode a raw LLM response into structured form.
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(&self, response: Json) -> Result<Json> {
-        let annotated = self
-            .inner_response_codec
-            .decode_response(&response)
-            .map_err(Error::from)?;
-        serde_json::to_value(&annotated).map_err(Error::from)
+        decode_response(&self.codec, &response)
     }
 }

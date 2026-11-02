@@ -15,7 +15,9 @@ use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMod
 use napi::{Env, check_status};
 
 use crate::callback_factory::Factories;
-use crate::convert::{JsArg, Tsfn, abort_tsfn, js_value, record_callback_error};
+use crate::convert::{
+    JsArg, Tsfn, abort_tsfn, js_value, record_callback_error, report_queue_status,
+};
 use crate::error::{Error, Result};
 
 pub(crate) type Settler = Box<dyn FnOnce(&Env) -> napi::Result<JsArg> + Send>;
@@ -219,7 +221,7 @@ impl PendingPromise {
             return;
         };
         // A closing settler means the environment is tearing down and the promise is gone.
-        let _ = self.settler.call(
+        let status = self.settler.call(
             Settlement {
                 deferred,
                 outcome,
@@ -229,6 +231,7 @@ impl PendingPromise {
             },
             ThreadsafeFunctionCallMode::NonBlocking,
         );
+        report_queue_status(status, "a promise settlement");
     }
 }
 

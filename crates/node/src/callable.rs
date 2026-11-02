@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 use napi::bindgen_prelude::{
     FnArgs, FromNapiValue, Function, FunctionCallContext, JsObjectValue, JsValuesTupleIntoVec,
@@ -47,7 +49,7 @@ use nemo_relay::error::{FlowError, Result};
 use crate::callback_factory;
 use crate::convert::{
     HandledTsfn, JsArg, JsArgs2, JsArgs3, PersistentJsFunction, Tsfn, abort_tsfn, closure_function,
-    detach, js_value, record_callback_error,
+    detach, js_value, lock, record_callback_error,
 };
 use crate::environment::teardown_flag;
 use crate::error::Error;
@@ -67,7 +69,7 @@ fn js_subscriber_callbacks() -> &'static (Mutex<JsSubscriberCallbackState>, Cond
 
 fn reserve_js_subscriber_callback() -> u64 {
     let (state, _) = js_subscriber_callbacks();
-    let mut state = state.lock().unwrap();
+    let mut state = lock(state);
     state.next_id += 1;
     let id = state.next_id;
     state.pending.insert(id);
@@ -76,23 +78,20 @@ fn reserve_js_subscriber_callback() -> u64 {
 
 fn complete_js_subscriber_callback(id: u64) {
     let (state, completed) = js_subscriber_callbacks();
-    let mut state = state.lock().unwrap();
+    let mut state = lock(state);
     state.pending.remove(&id);
     completed.notify_all();
 }
 
-pub(crate) fn flush_js_subscriber_callbacks() -> Result<()> {
+pub(crate) fn flush_js_subscriber_callbacks() {
     let (state, completed) = js_subscriber_callbacks();
-    let mut state = state
-        .lock()
-        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    let mut state = lock(state);
     let watermark = state.next_id;
     while state.pending.range(..=watermark).next().is_some() {
         state = completed
             .wait(state)
-            .map_err(|error| FlowError::Internal(error.to_string()))?;
+            .unwrap_or_else(PoisonError::into_inner);
     }
-    Ok(())
 }
 
 /// Structured codec identity delivered to JavaScript LLM sanitizers.
@@ -235,8 +234,12 @@ async fn await_callback_result(
 }
 
 /// Wrap a Promise-aware JS `(name, args) => string | null` tool guardrail.
-pub fn wrap_js_tool_conditional_promise_fn(func: Arc<PromiseAwareFn>) -> ToolConditionalFn {
-    Arc::new(move |name: String, args: Json| {
+pub fn wrap_js_tool_conditional_promise_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<ToolConditionalFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(move |name: String, args: Json| {
         let func = func.clone();
         Box::pin(async move {
             let value = func
@@ -255,24 +258,32 @@ pub fn wrap_js_tool_conditional_promise_fn(func: Arc<PromiseAwareFn>) -> ToolCon
                 }
             }
         })
-    })
+    }))
 }
 
 /// Wrap a Promise-aware JS `(name, args) => Json` tool request intercept.
-pub fn wrap_js_tool_request_intercept_promise_fn(func: Arc<PromiseAwareFn>) -> ToolInterceptFn {
-    Arc::new(move |name: String, args: Json| {
+pub fn wrap_js_tool_request_intercept_promise_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<ToolInterceptFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(move |name: String, args: Json| {
         let func = func.clone();
         Box::pin(async move {
             func.call_spread(vec![Json::String(name), args])
                 .await
                 .inspect_err(|error| record_callback_error(error.to_string()))
         })
-    })
+    }))
 }
 
 /// Wrap a Promise-aware JS tool sanitizer.
-pub fn wrap_js_tool_sanitize_promise_fn(func: Arc<PromiseAwareFn>) -> ToolSanitizeFn {
-    Arc::new(move |name: String, value: Json| {
+pub fn wrap_js_tool_sanitize_promise_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<ToolSanitizeFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(move |name: String, value: Json| {
         let func = func.clone();
         let publication = nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
         Box::pin(async move {
@@ -286,12 +297,16 @@ pub fn wrap_js_tool_sanitize_promise_fn(func: Arc<PromiseAwareFn>) -> ToolSaniti
                 record_callback_error(error.to_string());
             })
         })
-    })
+    }))
 }
 
 /// Wrap a Promise-aware JS LLM request sanitizer.
-pub fn wrap_js_llm_sanitize_request_promise_fn(func: Arc<PromiseAwareFn>) -> LlmSanitizeRequestFn {
-    Arc::new(
+pub fn wrap_js_llm_sanitize_request_promise_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<LlmSanitizeRequestFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(
         move |request: LlmRequest, context: LlmSanitizeRequestContext| {
             let func = func.clone();
             let publication =
@@ -335,41 +350,50 @@ pub fn wrap_js_llm_sanitize_request_promise_fn(func: Arc<PromiseAwareFn>) -> Llm
                 }
             })
         },
-    )
+    ))
 }
 
 /// Wrap a Promise-aware JS LLM response sanitizer.
 pub fn wrap_js_llm_sanitize_response_promise_fn(
-    func: Arc<PromiseAwareFn>,
-) -> LlmSanitizeResponseFn {
-    Arc::new(move |response: Json, context: LlmSanitizeResponseContext| {
-        let func = func.clone();
-        let publication = nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
-        Box::pin(async move {
-            let context = js_llm_sanitize_response_context(&context);
-            let build_args: crate::promise_call::Arg0Builder = Box::new(move |env| {
-                let mut args = env.create_array(2)?;
-                let response = js_value(env, response)?;
-                args.set(0, response)?;
-                args.set(1, js_llm_sanitize_response_context_to_napi(env, context)?)?;
-                Ok(detach(env, &args))
-            });
-            let value = if publication {
-                func.call_spread_with_arg0_for_publication(build_args).await
-            } else {
-                func.call_spread_with_arg0(build_args).await
-            }
-            .inspect_err(|error| {
-                record_callback_error(error.to_string());
-            })?;
-            Ok((!value.is_null()).then_some(value))
-        })
-    })
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<LlmSanitizeResponseFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(
+        move |response: Json, context: LlmSanitizeResponseContext| {
+            let func = func.clone();
+            let publication =
+                nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
+            Box::pin(async move {
+                let context = js_llm_sanitize_response_context(&context);
+                let build_args: crate::promise_call::Arg0Builder = Box::new(move |env| {
+                    let mut args = env.create_array(2)?;
+                    let response = js_value(env, response)?;
+                    args.set(0, response)?;
+                    args.set(1, js_llm_sanitize_response_context_to_napi(env, context)?)?;
+                    Ok(detach(env, &args))
+                });
+                let value = if publication {
+                    func.call_spread_with_arg0_for_publication(build_args).await
+                } else {
+                    func.call_spread_with_arg0(build_args).await
+                }
+                .inspect_err(|error| {
+                    record_callback_error(error.to_string());
+                })?;
+                Ok((!value.is_null()).then_some(value))
+            })
+        },
+    ))
 }
 
 /// Wrap a Promise-aware JS `(request) => string | null` LLM guardrail.
-pub fn wrap_js_llm_conditional_promise_fn(func: Arc<PromiseAwareFn>) -> LlmConditionalFn {
-    Arc::new(move |request: LlmRequest| {
+pub fn wrap_js_llm_conditional_promise_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<LlmConditionalFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(move |request: LlmRequest| {
         let func = func.clone();
         Box::pin(async move {
             let request = serde_json::to_value(request).map_err(|error| {
@@ -395,14 +419,16 @@ pub fn wrap_js_llm_conditional_promise_fn(func: Arc<PromiseAwareFn>) -> LlmCondi
                 }
             }
         })
-    })
+    }))
 }
 
 /// Wrap a Promise-aware JS LLM request intercept.
 pub fn wrap_js_llm_request_intercept_promise_fn(
-    func: Arc<PromiseAwareFn>,
-) -> LlmRequestInterceptFn {
-    Arc::new(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<LlmRequestInterceptFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(
         move |name: String, request: LlmRequest, annotated: Option<AnnotatedLlmRequest>| {
             let func = func.clone();
             Box::pin(async move {
@@ -454,7 +480,7 @@ pub fn wrap_js_llm_request_intercept_promise_fn(
                 })
             })
         },
-    )
+    ))
 }
 
 /// Wrap a Promise-aware JS event sanitizer.
@@ -462,88 +488,97 @@ pub fn wrap_js_llm_request_intercept_promise_fn(
 /// All lifecycle publication invokes these callbacks from Relay's serial
 /// dispatcher. The invocation context is also used by queued tool and LLM
 /// observability sanitizers so a flush cannot wait on its own publication.
-pub fn wrap_js_event_sanitize_promise_fn(func: Arc<PromiseAwareFn>) -> EventSanitizeFn {
-    Arc::new(move |event: Arc<Event>, fields: CoreEventSanitizeFields| {
-        let func = func.clone();
-        Box::pin(async move {
-            let event_json = JsEvent::try_from_event(&event)
-                .map(JsEvent::into_json)
-                .map_err(|error| {
-                    let error = FlowError::Internal(format!(
-                        "failed to serialize JS event sanitizer context: {error}"
-                    ));
-                    record_callback_error(error.to_string());
-                    error
-                })?;
-            let js_fields = EventSanitizeFields {
-                data: fields.data,
-                category_profile: fields
-                    .category_profile
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()
+pub fn wrap_js_event_sanitize_promise_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<EventSanitizeFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(
+        move |event: Arc<Event>, fields: CoreEventSanitizeFields| {
+            let func = func.clone();
+            Box::pin(async move {
+                let event_json = JsEvent::try_from_event(&event)
+                    .map(JsEvent::into_json)
                     .map_err(|error| {
                         let error = FlowError::Internal(format!(
-                            "failed to serialize JS event sanitizer category profile: {error}"
+                            "failed to serialize JS event sanitizer context: {error}"
+                        ));
+                        record_callback_error(error.to_string());
+                        error
+                    })?;
+                let js_fields = EventSanitizeFields {
+                    data: fields.data,
+                    category_profile: fields
+                        .category_profile
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(|error| {
+                            let error = FlowError::Internal(format!(
+                                "failed to serialize JS event sanitizer category profile: {error}"
+                            ));
+                            record_callback_error(error.to_string());
+                            error
+                        })?,
+                    metadata: fields.metadata,
+                };
+                let args = vec![
+                    event_json,
+                    serde_json::to_value(js_fields).map_err(|error| {
+                        let error = FlowError::Internal(format!(
+                            "failed to serialize JS event sanitizer fields: {error}"
                         ));
                         record_callback_error(error.to_string());
                         error
                     })?,
-                metadata: fields.metadata,
-            };
-            let args = vec![
-                event_json,
-                serde_json::to_value(js_fields).map_err(|error| {
-                    let error = FlowError::Internal(format!(
-                        "failed to serialize JS event sanitizer fields: {error}"
-                    ));
+                ];
+                let publication =
+                    nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
+                let value = if publication {
+                    func.call_spread_for_publication(args).await
+                } else {
+                    func.call_spread(args).await
+                }
+                .inspect_err(|error| {
+                    // Scope and mark publication happens on the dispatcher
+                    // thread. The core clears the governed observability fields while
+                    // making the binding-visible failure available to Node.
                     record_callback_error(error.to_string());
-                    error
-                })?,
-            ];
-            let publication =
-                nemo_relay::api::runtime::subscriber_dispatcher::in_dispatcher_callback();
-            let value = if publication {
-                func.call_spread_for_publication(args).await
-            } else {
-                func.call_spread(args).await
-            }
-            .inspect_err(|error| {
-                // Scope and mark publication happens on the dispatcher
-                // thread. The core clears the governed observability fields while
-                // making the binding-visible failure available to Node.
-                record_callback_error(error.to_string());
-            })?;
-            let fields = event_sanitize_fields_from_json(value).map_err(|error| {
-                let error =
-                    FlowError::Internal(format!("invalid JS event sanitizer result: {error}"));
-                record_callback_error(error.to_string());
-                error
-            })?;
-            let category_profile = fields
-                .category_profile
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|error| {
+                })?;
+                let fields = event_sanitize_fields_from_json(value).map_err(|error| {
                     let error =
                         FlowError::Internal(format!("invalid JS event sanitizer result: {error}"));
                     record_callback_error(error.to_string());
                     error
                 })?;
-            Ok(CoreEventSanitizeFields {
-                data: fields.data,
-                category_profile,
-                metadata: fields.metadata,
+                let category_profile = fields
+                    .category_profile
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| {
+                        let error = FlowError::Internal(format!(
+                            "invalid JS event sanitizer result: {error}"
+                        ));
+                        record_callback_error(error.to_string());
+                        error
+                    })?;
+                Ok(CoreEventSanitizeFields {
+                    data: fields.data,
+                    category_profile,
+                    metadata: fields.metadata,
+                })
             })
-        })
-    })
+        },
+    ))
 }
 
 /// Wrap a Promise-aware JavaScript event metadata injector.
 pub fn wrap_js_event_metadata_injector_promise_fn(
-    func: Arc<PromiseAwareFn>,
-) -> EventMetadataInjectorFn {
-    Arc::new(move |event: Arc<Event>| {
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<EventMetadataInjectorFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(move |event: Arc<Event>| {
         let func = func.clone();
         Box::pin(async move {
             let event_json = JsEvent::try_from_event(&event)
@@ -571,15 +606,29 @@ pub fn wrap_js_event_metadata_injector_promise_fn(
                 error
             })
         })
-    })
+    }))
 }
 
-fn recv_json_result(
-    rx: std::sync::mpsc::Receiver<Result<Json>>,
+pub(crate) fn recv_callback_result(
+    rx: &std::sync::mpsc::Receiver<Result<Json>>,
+    timeout: Option<Duration>,
     error_prefix: &str,
 ) -> Result<Json> {
-    rx.recv()
-        .map_err(|e| FlowError::Internal(format!("{error_prefix}: {e}")))?
+    let received = match timeout {
+        Some(timeout) => rx.recv_timeout(timeout).map_err(|error| match error {
+            RecvTimeoutError::Timeout => FlowError::Internal(format!(
+                "{error_prefix}: callback timed out after {} seconds",
+                timeout.as_secs()
+            )),
+            RecvTimeoutError::Disconnected => {
+                FlowError::Internal(format!("{error_prefix}: callback channel disconnected"))
+            }
+        }),
+        None => rx.recv().map_err(|_| {
+            FlowError::Internal(format!("{error_prefix}: callback channel disconnected"))
+        }),
+    };
+    received?
 }
 
 /// Wrap a JS function `(name: string, args: object) => object` for tool sanitize/intercept.
@@ -831,11 +880,7 @@ fn completion_function(
     let pending = Arc::clone(pending);
     let callback = closure_function(env, name, move |ctx| {
         let envelope = unwrap_envelope(ctx.get::<Unknown>(0)?, error_prefix);
-        if let Some(sender) = pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        if let Some(sender) = lock(&pending).take() {
             let _ = sender.send(envelope);
         }
         Ok(())
@@ -917,11 +962,7 @@ impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args>
         let envelope = self.function.function()?.call(args)?;
         let envelope = unsafe { envelope.into_unknown(&env) };
         if envelope.get_type()? != ValueType::Undefined
-            && let Some(sender) = self
-                .pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
+            && let Some(sender) = lock(&self.pending).take()
         {
             let _ = sender.send(unwrap_envelope(envelope, self.error_prefix));
         }
@@ -934,10 +975,7 @@ impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args>
         sender: tokio::sync::oneshot::Sender<Result<Json>>,
         name: &str,
     ) -> Result<()> {
-        *self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+        *lock(&self.pending) = Some(sender);
         if self.calls_directly() {
             return self.call_directly(call).map_err(|error| {
                 let message = format!("nemo_relay: JS {name} callback failed: {error}");
@@ -1021,10 +1059,7 @@ pub fn wrap_js_finalizer_fn(
                 if !teardown.load(Ordering::Acquire) {
                     record_callback_error(failure.to_string());
                 }
-                *error
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(Error::from(failure.clone()));
+                *lock(&error) = Some(Error::from(failure.clone()));
             })
         })
     }))
@@ -1134,70 +1169,50 @@ struct JsCodecEncodeArgument<'a> {
     original: &'a LlmRequest,
 }
 
-/// A JavaScript codec callback that any thread can call.
+/// JavaScript callback that any thread can call and wait on.
 ///
 /// A throw or an unreadable return value comes back as an error.
-pub(crate) struct JsCodecCallback {
-    direct: PersistentJsFunction<Json, JsArg>,
-    queued: Tsfn<Json, Json, JsArg>,
-    registration_thread: std::thread::ThreadId,
+pub(crate) struct SyncJsCallback<Args: 'static + JsValuesTupleIntoVec + Send> {
+    direct: PersistentJsFunction<Args, JsArg>,
+    queued: Tsfn<Args, Args, JsArg>,
+    thread: std::thread::ThreadId,
     error_prefix: &'static str,
+    timeout: Option<Duration>,
 }
 
-impl JsCodecCallback {
+impl<Args: 'static + JsValuesTupleIntoVec + Send> SyncJsCallback<Args> {
     pub(crate) fn new(
         env: &Env,
-        func: &Function<JsArg, JsArg>,
+        wrapper: Function<Args, JsArg>,
         error_prefix: &'static str,
+        timeout: Option<Duration>,
     ) -> napi::Result<Self> {
-        let wrapper: Function<Json, JsArg> = callback_factory::wrap_execution_callback(env, func)?;
-        let direct = PersistentJsFunction::new(env, &wrapper)?;
-        let queued = wrapper
-            .build_threadsafe_function::<Json>()
-            .weak::<true>()
-            .build_callback(|ctx: ThreadsafeCallContext<Json>| Ok(ctx.value))?;
         Ok(Self {
-            direct,
-            queued,
-            registration_thread: std::thread::current().id(),
+            direct: PersistentJsFunction::new(env, &wrapper)?,
+            queued: wrapper
+                .build_threadsafe_function::<Args>()
+                .weak::<true>()
+                .build()?,
+            thread: std::thread::current().id(),
             error_prefix,
+            timeout,
         })
     }
 
-    fn call<A: Serialize, T: DeserializeOwned>(&self, argument: &A, expected: &str) -> Result<T> {
-        serde_json::to_value(argument)
-            .map_err(|error| {
-                FlowError::Internal(format!(
-                    "{}: could not serialize the argument: {error}",
-                    self.error_prefix
-                ))
-            })
-            .and_then(|argument| self.invoke(argument))
-            .and_then(|value| {
-                serde_json::from_value(value).map_err(|error| {
-                    FlowError::Internal(format!(
-                        "{}: expected {expected}: {error}",
-                        self.error_prefix
-                    ))
-                })
-            })
-            .inspect_err(|error| record_callback_error(error.to_string()))
-    }
-
-    fn invoke(&self, argument: Json) -> Result<Json> {
-        if std::thread::current().id() == self.registration_thread {
+    pub(crate) fn call(&self, args: Args) -> Result<Json> {
+        if std::thread::current().id() == self.thread {
             let env = self.direct.env();
             let envelope = self
                 .direct
                 .function()
-                .and_then(|function| function.call(argument))
+                .and_then(|function| function.call(args))
                 .map_err(|error| FlowError::Internal(format!("{}: {error}", self.error_prefix)))?;
             return unwrap_envelope(unsafe { envelope.into_unknown(&env) }, self.error_prefix);
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let error_prefix = self.error_prefix;
         let status = self.queued.call_with_return_value(
-            argument,
+            args,
             ThreadsafeFunctionCallMode::NonBlocking,
             move |value: napi::Result<JsArg>, env| {
                 let _ = tx.send(tsfn_envelope(&env, value, error_prefix));
@@ -1206,27 +1221,65 @@ impl JsCodecCallback {
         );
         if status != napi::Status::Ok {
             return Err(FlowError::Internal(format!(
-                "{}: could not queue the callback: {status:?}",
+                "{}: failed to queue callback: {status:?}",
                 self.error_prefix
             )));
         }
-        recv_json_result(rx, self.error_prefix)
+        recv_callback_result(&rx, self.timeout, self.error_prefix)
     }
+}
+
+pub(crate) fn js_codec_callback(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+    error_prefix: &'static str,
+) -> napi::Result<SyncJsCallback<Json>> {
+    SyncJsCallback::new(
+        env,
+        callback_factory::wrap_execution_callback(env, func)?,
+        error_prefix,
+        None,
+    )
+}
+
+fn codec_call<A: Serialize, T: DeserializeOwned>(
+    callback: &SyncJsCallback<Json>,
+    argument: &A,
+    expected: &str,
+) -> Result<T> {
+    serde_json::to_value(argument)
+        .map_err(|error| {
+            FlowError::Internal(format!(
+                "{}: could not serialize the argument: {error}",
+                callback.error_prefix
+            ))
+        })
+        .and_then(|argument| callback.call(argument))
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                FlowError::Internal(format!(
+                    "{}: expected {expected}: {error}",
+                    callback.error_prefix
+                ))
+            })
+        })
+        .inspect_err(|error| record_callback_error(error.to_string()))
 }
 
 /// Request codec backed by JavaScript `decode` and `encode` callbacks.
 struct NapiCodec {
-    decode: JsCodecCallback,
-    encode: JsCodecCallback,
+    decode: SyncJsCallback<Json>,
+    encode: SyncJsCallback<Json>,
 }
 
 impl LlmCodec for NapiCodec {
     fn decode(&self, request: &LlmRequest) -> Result<AnnotatedLlmRequest> {
-        self.decode.call(request, "AnnotatedLlmRequest")
+        codec_call(&self.decode, request, "AnnotatedLlmRequest")
     }
 
     fn encode(&self, annotated: &AnnotatedLlmRequest, original: &LlmRequest) -> Result<LlmRequest> {
-        self.encode.call(
+        codec_call(
+            &self.encode,
             &JsCodecEncodeArgument {
                 annotated,
                 original,
@@ -1237,7 +1290,10 @@ impl LlmCodec for NapiCodec {
 }
 
 /// Build a request codec from JavaScript `decode` and `encode` callbacks.
-pub(crate) fn wrap_js_codec(decode: JsCodecCallback, encode: JsCodecCallback) -> Arc<dyn LlmCodec> {
+pub(crate) fn wrap_js_codec(
+    decode: SyncJsCallback<Json>,
+    encode: SyncJsCallback<Json>,
+) -> Arc<dyn LlmCodec> {
     Arc::new(NapiCodec { decode, encode })
 }
 
@@ -1247,18 +1303,18 @@ pub(crate) fn wrap_js_codec(decode: JsCodecCallback, encode: JsCodecCallback) ->
 
 /// Response codec backed by a JavaScript `decodeResponse` callback.
 struct NapiResponseCodec {
-    decode_response: JsCodecCallback,
+    decode_response: SyncJsCallback<Json>,
 }
 
 impl LlmResponseCodec for NapiResponseCodec {
     fn decode_response(&self, response: &Json) -> Result<AnnotatedLlmResponse> {
-        self.decode_response.call(response, "AnnotatedLlmResponse")
+        codec_call(&self.decode_response, response, "AnnotatedLlmResponse")
     }
 }
 
 /// Build a response codec from a JavaScript `decodeResponse` callback.
 pub(crate) fn wrap_js_response_codec(
-    decode_response: JsCodecCallback,
+    decode_response: SyncJsCallback<Json>,
 ) -> Arc<dyn LlmResponseCodec> {
     Arc::new(NapiResponseCodec { decode_response })
 }
@@ -1269,9 +1325,11 @@ pub(crate) fn wrap_js_response_codec(
 /// and `toolCallId`, so it can correlate a result it produces itself with the
 /// originating tool call.
 pub fn wrap_js_tool_exec_intercept_fn(
-    func: Arc<PromiseAwareFn>,
-) -> nemo_relay::api::runtime::ToolExecutionFn {
-    Arc::new(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<nemo_relay::api::runtime::ToolExecutionFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(
         move |context: ToolExecutionContext, next: ToolExecutionNextFn| {
             let func = func.clone();
             let js_context = serde_json::json!({
@@ -1281,7 +1339,7 @@ pub fn wrap_js_tool_exec_intercept_fn(
             });
             Box::pin(call_js_tool_exec_intercept(func, js_context, next))
         },
-    )
+    ))
 }
 
 /// Invoke a JS tool execution intercept and decode its outcome.
@@ -1328,8 +1386,12 @@ async fn call_js_tool_exec_intercept(
 /// The JS callback receives the `LlmRequest` serialized as a plain JSON object
 /// and a real `next(request)` function that returns a Promise for the downstream
 /// result.
-pub fn wrap_js_llm_exec_intercept_fn(func: Arc<PromiseAwareFn>) -> LlmExecutionFn {
-    Arc::new(
+pub fn wrap_js_llm_exec_intercept_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<LlmExecutionFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(
         move |_name: &str,
               request: LlmRequest,
               context: LlmExecutionContext,
@@ -1351,17 +1413,19 @@ pub fn wrap_js_llm_exec_intercept_fn(func: Arc<PromiseAwareFn>) -> LlmExecutionF
                     .await
             })
         },
-    )
+    ))
 }
 
 /// Wrap a JS `(request: object, signal: AbortSignal) => AsyncIterable` streaming LLM provider.
 ///
 /// Each call registers its abort in `cancellation`.
 pub fn wrap_js_llm_stream_fn(
-    func: Arc<PromiseAwareFn>,
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
     cancellation: StreamCancellation,
-) -> LlmStreamExecutionNextFn {
-    Arc::new(move |request: LlmRequest| {
+) -> napi::Result<LlmStreamExecutionNextFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(move |request: LlmRequest| {
         let func = func.clone();
         let cancellation = cancellation.clone();
         Box::pin(async move {
@@ -1370,7 +1434,7 @@ pub fn wrap_js_llm_stream_fn(
             })?;
             func.call_stream(request, &cancellation).await
         })
-    })
+    }))
 }
 
 /// Wrap a JS function `(request, context, next) => result` for LLM stream execution intercept.
@@ -1379,8 +1443,12 @@ pub fn wrap_js_llm_stream_fn(
 /// and a real `next(request)` function whose Promise resolves to a lazy
 /// async iterable. The callback can return it directly or wrap it with an async
 /// generator without materializing the downstream stream.
-pub fn wrap_js_llm_stream_exec_intercept_fn(func: Arc<PromiseAwareFn>) -> LlmStreamExecutionFn {
-    Arc::new(
+pub fn wrap_js_llm_stream_exec_intercept_fn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<LlmStreamExecutionFn> {
+    let func = Arc::new(PromiseAwareFn::new(env, func)?);
+    Ok(Arc::new(
         move |_name: &str,
               request: LlmRequest,
               context: LlmExecutionContext,
@@ -1402,5 +1470,9 @@ pub fn wrap_js_llm_stream_exec_intercept_fn(func: Arc<PromiseAwareFn>) -> LlmStr
                     .await
             })
         },
-    )
+    ))
 }
+
+#[cfg(test)]
+#[path = "../tests/rust/callable_tests.rs"]
+mod tests;

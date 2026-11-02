@@ -6,14 +6,11 @@ use napi::bindgen_prelude::{BigInt, JsObjectValue, JsValue, Object, Unknown};
 use napi::{Env, JsString};
 use napi_derive::napi;
 
-use crate::convert::js_value;
+use crate::convert::{JAVASCRIPT_MAX_SAFE_INTEGER, js_value};
 use crate::error::{Error, Result};
-use nemo_relay::diagnostics::embedded::{self, EmbeddedDiagnosticError, EmbeddedDiagnosticsReader};
+use nemo_relay::diagnostics::embedded::{self, EmbeddedDiagnosticsReader};
 use serde_json::Value as Json;
 
-fn error(error: EmbeddedDiagnosticError) -> Error {
-    Error::from(error)
-}
 fn bounded_query(query: Option<JsString>) -> Result<String> {
     let Some(query) = query else {
         return Ok("{}".into());
@@ -63,9 +60,13 @@ fn native_value<'env>(env: &'env Env, value: &Json, field: &str) -> Result<Unkno
             Ok(array.to_unknown())
         }
         Json::Number(number) => {
-            if let Some(integer) = number.as_u64()
-                && integer > 9_007_199_254_740_991
-            {
+            let exceeds_safe_integer = number
+                .as_u64()
+                .is_some_and(|integer| integer > JAVASCRIPT_MAX_SAFE_INTEGER)
+                || number
+                    .as_i64()
+                    .is_some_and(|integer| integer.unsigned_abs() > JAVASCRIPT_MAX_SAFE_INTEGER);
+            if exceeds_safe_integer {
                 return Err(Error::invalid_argument("numeric_out_of_range"));
             }
             let value = number
@@ -89,7 +90,7 @@ impl DiagnosticsReader {
     #[napi(catch_unwind)]
     pub fn snapshot_json(&self, query_json: Option<JsString>) -> Result<String> {
         let query = bounded_query(query_json)?;
-        let page = self.inner.snapshot_json(&query).map_err(error)?;
+        let page = self.inner.snapshot_json(&query).map_err(Error::from)?;
         Ok(page.as_str().to_owned())
     }
     /// Return a caller-owned camelCase object. Diagnostic u64 fields are always bigint.
@@ -101,7 +102,7 @@ impl DiagnosticsReader {
         query_json: Option<JsString>,
     ) -> Result<Unknown<'env>> {
         let query = bounded_query(query_json)?;
-        let page = self.inner.snapshot_json(&query).map_err(error)?;
+        let page = self.inner.snapshot_json(&query).map_err(Error::from)?;
         let value: Json = serde_json::from_str(page.as_str())
             .map_err(|_| Error::generic_failure("invalid_snapshot"))?;
         native_value(env, &value, "")
@@ -110,7 +111,10 @@ impl DiagnosticsReader {
     #[napi(catch_unwind)]
     pub fn inspect_memory_json(&self, query_json: Option<JsString>) -> Result<String> {
         let query = bounded_query(query_json)?;
-        let page = self.inner.inspect_memory_json(&query).map_err(error)?;
+        let page = self
+            .inner
+            .inspect_memory_json(&query)
+            .map_err(Error::from)?;
         Ok(page.as_str().to_owned())
     }
     /// Return a caller-owned camelCase object. Diagnostic u64 fields are always bigint.
@@ -122,7 +126,10 @@ impl DiagnosticsReader {
         query_json: Option<JsString>,
     ) -> Result<Unknown<'env>> {
         let query = bounded_query(query_json)?;
-        let page = self.inner.inspect_memory_json(&query).map_err(error)?;
+        let page = self
+            .inner
+            .inspect_memory_json(&query)
+            .map_err(Error::from)?;
         let value: Json = serde_json::from_str(page.as_str())
             .map_err(|_| Error::generic_failure("invalid_snapshot"))?;
         native_value(env, &value, "")
@@ -130,7 +137,7 @@ impl DiagnosticsReader {
     /// Return independent core/adapter budgets, occupancy, and logging coverage.
     #[napi(ts_return_type = "object", catch_unwind)]
     pub fn info<'env>(&self, env: &'env Env) -> Result<Unknown<'env>> {
-        let value = serde_json::to_value(self.inner.info().map_err(error)?)
+        let value = serde_json::to_value(self.inner.info().map_err(Error::from)?)
             .map_err(|_| Error::generic_failure("invalid_metadata"))?;
         native_value(env, &value, "")
     }
@@ -141,7 +148,7 @@ impl DiagnosticsReader {
 pub fn diagnostics_reader() -> Result<DiagnosticsReader> {
     embedded::reader()
         .map(|inner| DiagnosticsReader { inner })
-        .map_err(error)
+        .map_err(Error::from)
 }
 
 /// Internal descriptor consumed by the JavaScript query adapter.

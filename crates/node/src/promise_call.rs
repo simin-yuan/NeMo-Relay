@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 
 use napi::Env;
@@ -28,7 +28,9 @@ use nemo_relay::api::runtime::{LlmStreamInner, MiddlewareContinuationContext};
 use nemo_relay::error::{FlowError, Result as FlowResult};
 
 use crate::callback_factory::{self, CallbackScope, PromiseSettlers};
-use crate::convert::{HandledTsfn, JsArg, abort_tsfn, closure_function, detach, js_value};
+use crate::convert::{
+    HandledTsfn, JsArg, abort_tsfn, closure_function, detach, js_value, lock, report_queue_status,
+};
 use crate::environment::{Liveness, create_promise, spawn_promise};
 use crate::error::{Error, Result};
 use tokio_stream::Stream;
@@ -63,10 +65,6 @@ pub(crate) fn publication_callback_context_id() -> Option<String> {
     PUBLICATION_CALLBACK_CONTEXT_ID
         .try_with(Clone::clone)
         .unwrap_or(None)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub type JsonNextFn =
@@ -311,10 +309,11 @@ impl CallCancellation {
         if self.finished.load(Ordering::Acquire) || self.requested.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = self.tsfn.call(
+        let status = self.tsfn.call(
             Ok(PromiseCall::Abort(self.call_id)),
             ThreadsafeFunctionCallMode::NonBlocking,
         );
+        report_queue_status(status, "a JavaScript callback abort");
     }
 }
 

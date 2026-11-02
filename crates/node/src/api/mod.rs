@@ -42,7 +42,7 @@ use nemo_relay::api::runtime::subscriber_dispatcher::{
     PublicationBuffer, with_nested_publication_buffer,
 };
 use nemo_relay::api::runtime::{
-    EventMetadataInjectorFn, EventSanitizeFn, LlmCollector, LlmExecutionNextFn, LlmFinalizer,
+    ConditionalMiddlewareGuardrailFn, LlmCollector, LlmExecutionNextFn, LlmFinalizer,
     LlmJsonStream, ToolExecutionNextFn,
 };
 use nemo_relay::api::runtime::{
@@ -89,9 +89,9 @@ pub(crate) const LLM_STREAM_BRIDGE_CAPACITY: usize = 32;
 use crate::callable;
 use crate::callback_factory::{self, CallbackScope};
 use crate::convert::{
-    Callback, JsArg, JsArgs2, PersistentJsFunction, Tsfn, abort_tsfn,
+    Callback, JAVASCRIPT_MAX_SAFE_INTEGER, JsArg, JsArgs2, Tsfn, abort_tsfn,
     clear_last_callback_error as clear_recorded_callback_error, closure_function, detach,
-    get_last_callback_error as get_recorded_callback_error, js_value, opt_json,
+    get_last_callback_error as get_recorded_callback_error, js_value, lock, opt_json,
     parse_timestamp_micros, record_callback_error,
 };
 use crate::environment::spawn_promise;
@@ -111,18 +111,14 @@ static NODE_ENVIRONMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NODE_ENVIRONMENT_LIFECYCLE_LOCK: StdMutex<()> = StdMutex::new(());
 
 fn register_node_environment() -> FlowResult<()> {
-    let _guard = NODE_ENVIRONMENT_LIFECYCLE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = lock(&NODE_ENVIRONMENT_LIFECYCLE_LOCK);
     nemo_relay::logging::initialize_default_logging()?;
     NODE_ENVIRONMENT_COUNT.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
 fn cleanup_node_environment() {
-    let _guard = NODE_ENVIRONMENT_LIFECYCLE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = lock(&NODE_ENVIRONMENT_LIFECYCLE_LOCK);
     if NODE_ENVIRONMENT_COUNT.fetch_sub(1, Ordering::AcqRel) == 1
         && let Err(error) = nemo_relay::logging::shutdown_default_logging()
     {
@@ -188,8 +184,6 @@ pub fn collect_resource_metrics(env: &Env) -> Result<PromiseRaw<'_, Unknown<'_>>
         },
     )
 }
-
-const JAVASCRIPT_MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum NodeResourceMetricInteger {
@@ -1053,23 +1047,22 @@ struct ScopedJsonCall {
     scope: CallbackScope,
 }
 
-fn scoped_json_callback_tsfn_from_wrapper(
-    callback: Function<JsArg, JsArg>,
-) -> Result<Tsfn<ScopedJsonCall, JsArgs2, JsArg>> {
-    Ok(callback
+fn scoped_json_callback_tsfn(
+    env: &Env,
+    func: &Function<JsArg, JsArg>,
+) -> napi::Result<Tsfn<ScopedJsonCall, JsArgs2, JsArg>> {
+    callback_factory::wrap_scoped_callback::<JsArgs2, JsArg>(env, func)?
         .build_threadsafe_function::<ScopedJsonCall>()
         .weak::<true>()
         .build_callback(|ctx: ThreadsafeCallContext<ScopedJsonCall>| {
             let value = js_value(&ctx.env, ctx.value.value)?;
             Ok(FnArgs::from((value, ctx.value.scope.into_js(&ctx.env)?)))
-        })?)
+        })
 }
 
-fn scoped_json_callback_tsfn(
-    env: &Env,
-    func: &Function<JsArg, JsArg>,
-) -> Result<Tsfn<ScopedJsonCall, JsArgs2, JsArg>> {
-    scoped_json_callback_tsfn_from_wrapper(callback_factory::wrap_scoped_callback(env, func)?)
+fn serialize_llm_request(request: &LlmRequest) -> FlowResult<Json> {
+    serde_json::to_value(request)
+        .map_err(|error| FlowError::Internal(format!("failed to serialize LlmRequest: {error}")))
 }
 
 fn scoped_tool_execution_fn(func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>) -> ToolExecutionNextFn {
@@ -1109,8 +1102,8 @@ fn scoped_llm_execution_fn(func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>) -> LlmExe
     Arc::new(move |request: LlmRequest| {
         let func = func.clone();
         let scope = CallbackScope::capture();
-        let request = serde_json::to_value(request).unwrap_or(Json::Null);
         Box::pin(async move {
+            let request = serialize_llm_request(&request)?;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let status = func.call_with_return_value(
                 ScopedJsonCall {
@@ -1166,94 +1159,111 @@ fn middleware_json_callback_tsfn(
     Ok(tsfn)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_plugin_event_sanitizer(
-    env: &Env,
-    context: &mut Object,
-    property: &str,
-    namespace_prefix: String,
-    registrations: Arc<StdMutex<Vec<PluginRegistration>>>,
-    register: fn(&str, i32, EventSanitizeFn) -> FlowResult<()>,
-    deregister: fn(&str) -> FlowResult<bool>,
+type PluginRegistrations = Arc<StdMutex<Vec<PluginRegistration>>>;
+
+fn push_plugin_registration(
+    registrations: &StdMutex<Vec<PluginRegistration>>,
+    name: String,
     label: &'static str,
-) -> napi::Result<()> {
-    let function = closure_function(env, property, move |ctx| {
-        let name = format!("{}{}", namespace_prefix, ctx.get::<String>(0)?);
-        let priority = ctx.get::<i32>(1)?;
-        let callback = ctx.get::<Callback>(2)?;
-        register(&name, priority, node_event_sanitize_fn(ctx.env, &callback)?)
-            .map_err(Error::from)?;
-        let name_clone = name.clone();
-        registrations.lock().unwrap().push(PluginRegistration::new(
-            "plugin",
-            name_clone.clone(),
-            Box::new(move || {
-                deregister(&name_clone).map(|_| ()).map_err(|error| {
-                    PluginError::RegistrationFailed(format!(
-                        "{label} deregistration failed: {error}"
-                    ))
-                })
-            }),
-        ));
-        Ok(())
-    })?;
-    context.set_named_property(property, function)
+    deregister: fn(&str) -> FlowResult<bool>,
+) {
+    let registered_name = name.clone();
+    lock(registrations).push(PluginRegistration::new(
+        "plugin",
+        name,
+        Box::new(move || {
+            deregister(&registered_name).map(|_| ()).map_err(|error| {
+                PluginError::RegistrationFailed(format!("{label} deregistration failed: {error}"))
+            })
+        }),
+    ));
 }
 
-fn add_plugin_event_metadata_injector(
-    env: &Env,
-    context: &mut Object,
+struct PluginContext<'env> {
+    env: &'env Env,
     namespace_prefix: String,
-    registrations: Arc<StdMutex<Vec<PluginRegistration>>>,
-) -> napi::Result<()> {
-    let function = closure_function(
-        env,
-        "__nemo_relay_plugin_register_event_metadata_injector",
-        move |ctx| {
-            let name = format!("{}{}", namespace_prefix, ctx.get::<String>(0)?);
+    registrations: PluginRegistrations,
+    object: Object<'env>,
+}
+
+impl PluginContext<'_> {
+    fn add(
+        &mut self,
+        property: &str,
+        callback: impl 'static + Fn(FunctionCallContext) -> Result<()>,
+    ) -> napi::Result<()> {
+        let function = closure_function(self.env, property, callback)?;
+        self.object.set_named_property(property, function)
+    }
+
+    fn method<F: 'static>(
+        &mut self,
+        property: &str,
+        label: &'static str,
+        make: fn(&Env, &Function<JsArg, JsArg>) -> napi::Result<F>,
+        register: fn(&str, i32, F) -> FlowResult<()>,
+        deregister: fn(&str) -> FlowResult<bool>,
+    ) -> napi::Result<()> {
+        let namespace_prefix = self.namespace_prefix.clone();
+        let registrations = Arc::clone(&self.registrations);
+        self.add(property, move |ctx| {
+            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
             let priority = ctx.get::<i32>(1)?;
             let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_event_metadata_injector(
+            register(&name, priority, make(ctx.env, &callback)?).map_err(Error::from)?;
+            push_plugin_registration(&registrations, name, label, deregister);
+            Ok(())
+        })
+    }
+
+    fn chain_method<F: 'static>(
+        &mut self,
+        property: &str,
+        label: &'static str,
+        make: fn(&Env, &Function<JsArg, JsArg>) -> napi::Result<F>,
+        register: fn(&str, i32, bool, F) -> FlowResult<()>,
+        deregister: fn(&str) -> FlowResult<bool>,
+    ) -> napi::Result<()> {
+        let namespace_prefix = self.namespace_prefix.clone();
+        let registrations = Arc::clone(&self.registrations);
+        self.add(property, move |ctx| {
+            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
+            let priority = ctx.get::<i32>(1)?;
+            let break_chain = ctx.get::<bool>(2)?;
+            let callback = ctx.get::<Callback>(3)?;
+            register(&name, priority, break_chain, make(ctx.env, &callback)?)
+                .map_err(Error::from)?;
+            push_plugin_registration(&registrations, name, label, deregister);
+            Ok(())
+        })
+    }
+
+    fn subscriber_method(&mut self) -> napi::Result<()> {
+        let namespace_prefix = self.namespace_prefix.clone();
+        let registrations = Arc::clone(&self.registrations);
+        self.add("registerSubscriber", move |ctx| {
+            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
+            let callback = ctx.get::<Callback>(1)?;
+            core_subscriber_api::register_subscriber(
                 &name,
-                priority,
-                node_event_metadata_injector_fn(ctx.env, &callback)?,
+                callable::wrap_js_event_subscriber(ctx.env, name.clone(), &callback)?,
             )
             .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            registrations.lock().unwrap().push(PluginRegistration::new(
-                "plugin",
-                name_clone.clone(),
-                Box::new(move || {
-                    core_registry_api::deregister_event_metadata_injector(&name_clone)
-                        .map(|_| ())
-                        .map_err(|error| {
-                            PluginError::RegistrationFailed(format!(
-                                "event metadata injector deregistration failed: {error}"
-                            ))
-                        })
-                }),
-            ));
+            push_plugin_registration(
+                &registrations,
+                name,
+                "subscriber",
+                core_subscriber_api::deregister_subscriber,
+            );
             Ok(())
-        },
-    )?;
-    context.set_named_property("registerEventMetadataInjector", function)
-}
+        })
+    }
 
-fn build_plugin_context(
-    env: &Env,
-    namespace_prefix: String,
-    registrations: Arc<StdMutex<Vec<PluginRegistration>>>,
-) -> napi::Result<Object<'_>> {
-    let mut context = Object::new(env)?;
-
-    let conditional_gate_regs = registrations.clone();
-    let conditional_gate_namespace = namespace_prefix.clone();
-    let register_conditional_gate = closure_function(
-        env,
-        "__nemo_relay_plugin_register_conditional_middleware_guardrail",
-        move |ctx| {
-            let name = format!("{}{}", conditional_gate_namespace, ctx.get::<String>(0)?);
+    fn conditional_gate_method(&mut self) -> napi::Result<()> {
+        let namespace_prefix = self.namespace_prefix.clone();
+        let registrations = Arc::clone(&self.registrations);
+        self.add("registerConditionalMiddlewareGuardrail", move |ctx| {
+            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
             let kinds = ctx
                 .get::<Vec<RuntimeRegistrationKind>>(1)?
                 .into_iter()
@@ -1261,624 +1271,154 @@ fn build_plugin_context(
                 .collect::<BTreeSet<_>>();
             let registration_name = ctx.get::<String>(2)?;
             let guardrail = ctx.get::<Callback>(3)?;
-            let callback = node_conditional_middleware_guardrail(ctx.env, &guardrail)?;
             core_registry_api::register_conditional_middleware_guardrail(
                 &name,
                 kinds,
                 &registration_name,
-                Arc::new(move |kinds, effective_name| {
-                    callback
-                        .call(
-                            kinds.iter().map(|kind| kind.as_str().to_string()).collect(),
-                            effective_name.to_string(),
-                        )
-                        .unwrap_or_else(|error| {
-                            record_callback_error(format!(
-                                "Node conditional middleware guardrail failed open: {error}"
-                            ));
-                            None
-                        })
-                }),
+                node_conditional_middleware_guardrail(ctx.env, &guardrail)?,
             )
             .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            conditional_gate_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_conditional_middleware_guardrail(&name_clone)
-                            .map(|_| ())
-                            .map_err(|error| {
-                                PluginError::RegistrationFailed(format!(
-                                    "conditional middleware guardrail deregistration failed: {error}"
-                                ))
-                            })
-                    }),
-                ));
+            push_plugin_registration(
+                &registrations,
+                name,
+                "conditional middleware guardrail",
+                core_registry_api::deregister_conditional_middleware_guardrail,
+            );
             Ok(())
-        },
-    )?;
-    context.set_named_property(
-        "registerConditionalMiddlewareGuardrail",
-        register_conditional_gate,
-    )?;
+        })
+    }
+}
 
-    let subscriber_regs = registrations.clone();
-    let subscriber_namespace = namespace_prefix.clone();
-    let register_subscriber = closure_function(
+fn build_plugin_context<'env>(
+    env: &'env Env,
+    namespace_prefix: String,
+    registrations: PluginRegistrations,
+) -> napi::Result<Object<'env>> {
+    let mut context = PluginContext {
         env,
-        "__nemo_relay_adaptive_register_subscriber",
-        move |ctx| {
-            let name = format!("{}{}", subscriber_namespace, ctx.get::<String>(0)?);
-            let callback = ctx.get::<Callback>(1)?;
-            core_subscriber_api::register_subscriber(
-                &name,
-                callable::wrap_js_event_subscriber(ctx.env, name.clone(), &callback)?,
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            subscriber_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_subscriber_api::deregister_subscriber(&name_clone)
-                            .map(|_| ())
-                            .map_err(|e| {
-                                PluginError::RegistrationFailed(format!(
-                                    "subscriber deregistration failed: {e}"
-                                ))
-                            })
-                    }),
-                ));
-            Ok(())
-        },
+        namespace_prefix,
+        registrations,
+        object: Object::new(env)?,
+    };
+    context.conditional_gate_method()?;
+    context.subscriber_method()?;
+    context.method(
+        "registerEventMetadataInjector",
+        "event metadata injector",
+        callable::wrap_js_event_metadata_injector_promise_fn,
+        core_registry_api::register_event_metadata_injector,
+        core_registry_api::deregister_event_metadata_injector,
     )?;
-    context.set_named_property("registerSubscriber", register_subscriber)?;
-
-    add_plugin_event_metadata_injector(
-        env,
-        &mut context,
-        namespace_prefix.clone(),
-        registrations.clone(),
-    )?;
-
-    add_plugin_event_sanitizer(
-        env,
-        &mut context,
+    context.method(
         "registerMarkSanitizeGuardrail",
-        namespace_prefix.clone(),
-        registrations.clone(),
+        "mark sanitize guardrail",
+        callable::wrap_js_event_sanitize_promise_fn,
         core_registry_api::register_mark_sanitize_guardrail,
         core_registry_api::deregister_mark_sanitize_guardrail,
-        "mark sanitize guardrail",
     )?;
-    add_plugin_event_sanitizer(
-        env,
-        &mut context,
+    context.method(
         "registerScopeSanitizeStartGuardrail",
-        namespace_prefix.clone(),
-        registrations.clone(),
+        "scope start sanitize guardrail",
+        callable::wrap_js_event_sanitize_promise_fn,
         core_registry_api::register_scope_sanitize_start_guardrail,
         core_registry_api::deregister_scope_sanitize_start_guardrail,
-        "scope start sanitize guardrail",
     )?;
-    add_plugin_event_sanitizer(
-        env,
-        &mut context,
+    context.method(
         "registerScopeSanitizeEndGuardrail",
-        namespace_prefix.clone(),
-        registrations.clone(),
+        "scope end sanitize guardrail",
+        callable::wrap_js_event_sanitize_promise_fn,
         core_registry_api::register_scope_sanitize_end_guardrail,
         core_registry_api::deregister_scope_sanitize_end_guardrail,
-        "scope end sanitize guardrail",
     )?;
-
-    let tool_sanitize_request_regs = registrations.clone();
-    let tool_sanitize_request_namespace = namespace_prefix.clone();
-    let register_tool_sanitize_request_guardrail = closure_function(
-        env,
-        "__nemo_relay_plugin_register_tool_sanitize_request_guardrail",
-        move |ctx| {
-            let name = format!(
-                "{}{}",
-                tool_sanitize_request_namespace,
-                ctx.get::<String>(0)?
-            );
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_tool_sanitize_request_guardrail(
-                &name,
-                priority,
-                callable::wrap_js_tool_sanitize_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            tool_sanitize_request_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_tool_sanitize_request_guardrail(&name_clone)
-                            .map(|_| ())
-                            .map_err(|e| {
-                                PluginError::RegistrationFailed(format!(
-                                    "tool sanitize request guardrail deregistration failed: {e}"
-                                ))
-                            })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerToolSanitizeRequestGuardrail",
-        register_tool_sanitize_request_guardrail,
+        "tool sanitize request guardrail",
+        callable::wrap_js_tool_sanitize_promise_fn,
+        core_registry_api::register_tool_sanitize_request_guardrail,
+        core_registry_api::deregister_tool_sanitize_request_guardrail,
     )?;
-
-    let tool_sanitize_response_regs = registrations.clone();
-    let tool_sanitize_response_namespace = namespace_prefix.clone();
-    let register_tool_sanitize_response_guardrail = closure_function(
-        env,
-        "__nemo_relay_plugin_register_tool_sanitize_response_guardrail",
-        move |ctx| {
-            let name = format!(
-                "{}{}",
-                tool_sanitize_response_namespace,
-                ctx.get::<String>(0)?
-            );
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_tool_sanitize_response_guardrail(
-                &name,
-                priority,
-                callable::wrap_js_tool_sanitize_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            tool_sanitize_response_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_tool_sanitize_response_guardrail(&name_clone)
-                            .map(|_| ())
-                            .map_err(|e| {
-                                PluginError::RegistrationFailed(format!(
-                                    "tool sanitize response guardrail deregistration failed: {e}"
-                                ))
-                            })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerToolSanitizeResponseGuardrail",
-        register_tool_sanitize_response_guardrail,
+        "tool sanitize response guardrail",
+        callable::wrap_js_tool_sanitize_promise_fn,
+        core_registry_api::register_tool_sanitize_response_guardrail,
+        core_registry_api::deregister_tool_sanitize_response_guardrail,
     )?;
-
-    let tool_conditional_regs = registrations.clone();
-    let tool_conditional_namespace = namespace_prefix.clone();
-    let register_tool_conditional_execution_guardrail = closure_function(
-        env,
-        "__nemo_relay_plugin_register_tool_conditional_execution_guardrail",
-        move |ctx| {
-            let name = format!("{}{}", tool_conditional_namespace, ctx.get::<String>(0)?);
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_tool_conditional_execution_guardrail(
-                &name,
-                priority,
-                callable::wrap_js_tool_conditional_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            tool_conditional_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_tool_conditional_execution_guardrail(
-                            &name_clone,
-                        )
-                        .map(|_| ())
-                        .map_err(|e| {
-                            PluginError::RegistrationFailed(format!(
-                                "tool conditional execution guardrail deregistration failed: {e}"
-                            ))
-                        })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerToolConditionalExecutionGuardrail",
-        register_tool_conditional_execution_guardrail,
+        "tool conditional execution guardrail",
+        callable::wrap_js_tool_conditional_promise_fn,
+        core_registry_api::register_tool_conditional_execution_guardrail,
+        core_registry_api::deregister_tool_conditional_execution_guardrail,
     )?;
-
-    let llm_sanitize_request_regs = registrations.clone();
-    let llm_sanitize_request_namespace = namespace_prefix.clone();
-    let register_llm_sanitize_request_guardrail = closure_function(
-        env,
-        "__nemo_relay_plugin_register_llm_sanitize_request_guardrail",
-        move |ctx| {
-            let name = format!(
-                "{}{}",
-                llm_sanitize_request_namespace,
-                ctx.get::<String>(0)?
-            );
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_llm_sanitize_request_guardrail(
-                &name,
-                priority,
-                callable::wrap_js_llm_sanitize_request_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            llm_sanitize_request_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_llm_sanitize_request_guardrail(&name_clone)
-                            .map(|_| ())
-                            .map_err(|e| {
-                                PluginError::RegistrationFailed(format!(
-                                    "llm sanitize request guardrail deregistration failed: {e}"
-                                ))
-                            })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerLlmSanitizeRequestGuardrail",
-        register_llm_sanitize_request_guardrail,
+        "llm sanitize request guardrail",
+        callable::wrap_js_llm_sanitize_request_promise_fn,
+        core_registry_api::register_llm_sanitize_request_guardrail,
+        core_registry_api::deregister_llm_sanitize_request_guardrail,
     )?;
-
-    let llm_sanitize_response_regs = registrations.clone();
-    let llm_sanitize_response_namespace = namespace_prefix.clone();
-    let register_llm_sanitize_response_guardrail = closure_function(
-        env,
-        "__nemo_relay_plugin_register_llm_sanitize_response_guardrail",
-        move |ctx| {
-            let name = format!(
-                "{}{}",
-                llm_sanitize_response_namespace,
-                ctx.get::<String>(0)?
-            );
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_llm_sanitize_response_guardrail(
-                &name,
-                priority,
-                callable::wrap_js_llm_sanitize_response_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            llm_sanitize_response_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_llm_sanitize_response_guardrail(&name_clone)
-                            .map(|_| ())
-                            .map_err(|e| {
-                                PluginError::RegistrationFailed(format!(
-                                    "llm sanitize response guardrail deregistration failed: {e}"
-                                ))
-                            })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerLlmSanitizeResponseGuardrail",
-        register_llm_sanitize_response_guardrail,
+        "llm sanitize response guardrail",
+        callable::wrap_js_llm_sanitize_response_promise_fn,
+        core_registry_api::register_llm_sanitize_response_guardrail,
+        core_registry_api::deregister_llm_sanitize_response_guardrail,
     )?;
-
-    let llm_conditional_regs = registrations.clone();
-    let llm_conditional_namespace = namespace_prefix.clone();
-    let register_llm_conditional_execution_guardrail = closure_function(
-        env,
-        "__nemo_relay_plugin_register_llm_conditional_execution_guardrail",
-        move |ctx| {
-            let name = format!("{}{}", llm_conditional_namespace, ctx.get::<String>(0)?);
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_llm_conditional_execution_guardrail(
-                &name,
-                priority,
-                callable::wrap_js_llm_conditional_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            llm_conditional_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_llm_conditional_execution_guardrail(
-                            &name_clone,
-                        )
-                        .map(|_| ())
-                        .map_err(|e| {
-                            PluginError::RegistrationFailed(format!(
-                                "llm conditional execution guardrail deregistration failed: {e}"
-                            ))
-                        })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerLlmConditionalExecutionGuardrail",
-        register_llm_conditional_execution_guardrail,
+        "llm conditional execution guardrail",
+        callable::wrap_js_llm_conditional_promise_fn,
+        core_registry_api::register_llm_conditional_execution_guardrail,
+        core_registry_api::deregister_llm_conditional_execution_guardrail,
     )?;
-
-    let llm_regs = registrations.clone();
-    let llm_request_namespace = namespace_prefix.clone();
-    let register_llm_request_intercept = closure_function(
-        env,
-        "__nemo_relay_adaptive_register_llm_request_intercept",
-        move |ctx| {
-            let name = format!("{}{}", llm_request_namespace, ctx.get::<String>(0)?);
-            let priority = ctx.get::<i32>(1)?;
-            let break_chain = ctx.get::<bool>(2)?;
-            let callback = ctx.get::<Callback>(3)?;
-            core_registry_api::register_llm_request_intercept(
-                &name,
-                priority,
-                break_chain,
-                callable::wrap_js_llm_request_intercept_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            llm_regs.lock().unwrap().push(PluginRegistration::new(
-                "plugin",
-                name_clone.clone(),
-                Box::new(move || {
-                    core_registry_api::deregister_llm_request_intercept(&name_clone)
-                        .map(|_| ())
-                        .map_err(|e| {
-                            PluginError::RegistrationFailed(format!(
-                                "llm request intercept deregistration failed: {e}"
-                            ))
-                        })
-                }),
-            ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.chain_method(
         "registerLlmRequestIntercept",
-        register_llm_request_intercept,
+        "llm request intercept",
+        callable::wrap_js_llm_request_intercept_promise_fn,
+        core_registry_api::register_llm_request_intercept,
+        core_registry_api::deregister_llm_request_intercept,
     )?;
-
-    let llm_exec_regs = registrations.clone();
-    let llm_exec_namespace = namespace_prefix.clone();
-    let register_llm_execution_intercept = closure_function(
-        env,
-        "__nemo_relay_adaptive_register_llm_execution_intercept",
-        move |ctx| {
-            let name = format!("{}{}", llm_exec_namespace, ctx.get::<String>(0)?);
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_llm_execution_intercept(
-                &name,
-                priority,
-                callable::wrap_js_llm_exec_intercept_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            llm_exec_regs.lock().unwrap().push(PluginRegistration::new(
-                "plugin",
-                name_clone.clone(),
-                Box::new(move || {
-                    core_registry_api::deregister_llm_execution_intercept(&name_clone)
-                        .map(|_| ())
-                        .map_err(|e| {
-                            PluginError::RegistrationFailed(format!(
-                                "llm execution intercept deregistration failed: {e}"
-                            ))
-                        })
-                }),
-            ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerLlmExecutionIntercept",
-        register_llm_execution_intercept,
+        "llm execution intercept",
+        callable::wrap_js_llm_exec_intercept_fn,
+        core_registry_api::register_llm_execution_intercept,
+        core_registry_api::deregister_llm_execution_intercept,
     )?;
-
-    let llm_stream_exec_regs = registrations.clone();
-    let llm_stream_namespace = namespace_prefix.clone();
-    let register_llm_stream_execution_intercept = closure_function(
-        env,
-        "__nemo_relay_adaptive_register_llm_stream_execution_intercept",
-        move |ctx| {
-            let name = format!("{}{}", llm_stream_namespace, ctx.get::<String>(0)?);
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_llm_stream_execution_intercept(
-                &name,
-                priority,
-                callable::wrap_js_llm_stream_exec_intercept_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            llm_stream_exec_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_llm_stream_execution_intercept(&name_clone)
-                            .map(|_| ())
-                            .map_err(|e| {
-                                PluginError::RegistrationFailed(format!(
-                                    "llm stream execution intercept deregistration failed: {e}"
-                                ))
-                            })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerLlmStreamExecutionIntercept",
-        register_llm_stream_execution_intercept,
+        "llm stream execution intercept",
+        callable::wrap_js_llm_stream_exec_intercept_fn,
+        core_registry_api::register_llm_stream_execution_intercept,
+        core_registry_api::deregister_llm_stream_execution_intercept,
     )?;
-
-    let tool_request_regs = registrations.clone();
-    let tool_request_namespace = namespace_prefix.clone();
-    let register_tool_request_intercept = closure_function(
-        env,
-        "__nemo_relay_adaptive_register_tool_request_intercept",
-        move |ctx| {
-            let name = format!("{}{}", tool_request_namespace, ctx.get::<String>(0)?);
-            let priority = ctx.get::<i32>(1)?;
-            let break_chain = ctx.get::<bool>(2)?;
-            let callback = ctx.get::<Callback>(3)?;
-            core_registry_api::register_tool_request_intercept(
-                &name,
-                priority,
-                break_chain,
-                callable::wrap_js_tool_request_intercept_promise_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            tool_request_regs
-                .lock()
-                .unwrap()
-                .push(PluginRegistration::new(
-                    "plugin",
-                    name_clone.clone(),
-                    Box::new(move || {
-                        core_registry_api::deregister_tool_request_intercept(&name_clone)
-                            .map(|_| ())
-                            .map_err(|e| {
-                                PluginError::RegistrationFailed(format!(
-                                    "tool request intercept deregistration failed: {e}"
-                                ))
-                            })
-                    }),
-                ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.chain_method(
         "registerToolRequestIntercept",
-        register_tool_request_intercept,
+        "tool request intercept",
+        callable::wrap_js_tool_request_intercept_promise_fn,
+        core_registry_api::register_tool_request_intercept,
+        core_registry_api::deregister_tool_request_intercept,
     )?;
-
-    let tool_regs = registrations.clone();
-    let tool_exec_namespace = namespace_prefix;
-    let register_tool_execution_intercept = closure_function(
-        env,
-        "__nemo_relay_adaptive_register_tool_execution_intercept",
-        move |ctx| {
-            let name = format!("{}{}", tool_exec_namespace, ctx.get::<String>(0)?);
-            let priority = ctx.get::<i32>(1)?;
-            let callback = ctx.get::<Callback>(2)?;
-            core_registry_api::register_tool_execution_intercept(
-                &name,
-                priority,
-                callable::wrap_js_tool_exec_intercept_fn(Arc::new(PromiseAwareFn::new(
-                    ctx.env, &callback,
-                )?)),
-            )
-            .map_err(Error::from)?;
-
-            let name_clone = name.clone();
-            tool_regs.lock().unwrap().push(PluginRegistration::new(
-                "plugin",
-                name_clone.clone(),
-                Box::new(move || {
-                    core_registry_api::deregister_tool_execution_intercept(&name_clone)
-                        .map(|_| ())
-                        .map_err(|e| {
-                            PluginError::RegistrationFailed(format!(
-                                "tool execution intercept deregistration failed: {e}"
-                            ))
-                        })
-                }),
-            ));
-            Ok(())
-        },
-    )?;
-    context.set_named_property(
+    context.method(
         "registerToolExecutionIntercept",
-        register_tool_execution_intercept,
+        "tool execution intercept",
+        callable::wrap_js_tool_exec_intercept_fn,
+        core_registry_api::register_tool_execution_intercept,
+        core_registry_api::deregister_tool_execution_intercept,
     )?;
-
-    Ok(context)
+    Ok(context.object)
 }
 
 struct NodePluginRegisterCall {
     plugin_config: Json,
     namespace_prefix: String,
-    registrations: Arc<StdMutex<Vec<PluginRegistration>>>,
+    registrations: PluginRegistrations,
 }
 
 const CONDITIONAL_GATE_PREFIX: &str = "conditional middleware guardrail";
+
+const CONDITIONAL_GATE_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn decode_conditional_gate_result(value: FlowResult<Json>) -> Result<Option<String>> {
     serde_json::from_value(value?).map_err(|_| {
@@ -1886,109 +1426,31 @@ fn decode_conditional_gate_result(value: FlowResult<Json>) -> Result<Option<Stri
     })
 }
 
-struct NodeConditionalMiddlewareGuardrail {
-    direct: PersistentJsFunction<FnArgs<(Vec<String>, String)>, JsArg>,
-    thread_safe: Tsfn<(Vec<String>, String), JsArgs2, JsArg>,
-    registration_thread: std::thread::ThreadId,
-}
-
-const CONDITIONAL_GATE_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-fn recv_conditional_gate_result(
-    rx: std::sync::mpsc::Receiver<Result<Option<String>>>,
-    timeout: std::time::Duration,
-) -> Result<Option<String>> {
-    rx.recv_timeout(timeout).map_err(|error| match error {
-        std::sync::mpsc::RecvTimeoutError::Timeout => Error::generic_failure(format!(
-            "conditional gate callback timed out after {} seconds",
-            timeout.as_secs()
-        )),
-        std::sync::mpsc::RecvTimeoutError::Disconnected => {
-            Error::generic_failure("conditional gate callback channel disconnected")
-        }
-    })?
-}
-
-impl NodeConditionalMiddlewareGuardrail {
-    fn call(&self, kinds: Vec<String>, registration_name: String) -> Result<Option<String>> {
-        if std::thread::current().id() == self.registration_thread {
-            let env = self.direct.env();
-            let value = self
-                .direct
-                .function()?
-                .call((kinds, registration_name).into())?;
-            let envelope = unsafe { value.into_unknown(&env) };
-            return decode_conditional_gate_result(callable::unwrap_envelope(
-                envelope,
-                CONDITIONAL_GATE_PREFIX,
-            ));
-        }
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let status = self.thread_safe.call_with_return_value(
-            (kinds, registration_name),
-            ThreadsafeFunctionCallMode::NonBlocking,
-            move |value: napi::Result<JsArg>, env| {
-                let _ = tx.send(decode_conditional_gate_result(callable::tsfn_envelope(
-                    &env,
-                    value,
-                    CONDITIONAL_GATE_PREFIX,
-                )));
-                Ok(())
-            },
-        );
-        if status != napi::Status::Ok {
-            return Err(Error::generic_failure(format!(
-                "conditional gate callback scheduling failed: {status:?}"
-            )));
-        }
-        recv_conditional_gate_result(rx, CONDITIONAL_GATE_CALLBACK_TIMEOUT)
-    }
-}
-
 fn node_conditional_middleware_guardrail(
     env: &Env,
     guardrail: &Function<JsArg, JsArg>,
-) -> Result<Arc<NodeConditionalMiddlewareGuardrail>> {
-    let guardrail: Function<FnArgs<(Vec<String>, String)>, JsArg> =
-        callback_factory::wrap_conditional_gate_callback(env, guardrail)?;
-    let direct = PersistentJsFunction::new(env, &guardrail)?;
-    let registration_thread = std::thread::current().id();
-    let thread_safe = guardrail
-        .build_threadsafe_function::<(Vec<String>, String)>()
-        .weak::<true>()
-        .build_callback(|ctx: ThreadsafeCallContext<(Vec<String>, String)>| {
-            let kinds = js_value(&ctx.env, ctx.value.0)?;
-            let registration_name = ctx.env.create_string_from_std(ctx.value.1)?;
-            Ok(FnArgs::from((kinds, detach(&ctx.env, &registration_name))))
-        })?;
-    Ok(Arc::new(NodeConditionalMiddlewareGuardrail {
-        direct,
-        thread_safe,
-        registration_thread,
+) -> napi::Result<ConditionalMiddlewareGuardrailFn> {
+    let callback = callable::SyncJsCallback::new(
+        env,
+        callback_factory::wrap_conditional_gate_callback::<FnArgs<(Vec<String>, String)>, JsArg>(
+            env, guardrail,
+        )?,
+        CONDITIONAL_GATE_PREFIX,
+        Some(CONDITIONAL_GATE_CALLBACK_TIMEOUT),
+    )?;
+    Ok(Arc::new(move |kinds, effective_name| {
+        let kinds = kinds
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect::<Vec<String>>();
+        decode_conditional_gate_result(callback.call((kinds, effective_name.to_string()).into()))
+            .unwrap_or_else(|error| {
+                record_callback_error(format!(
+                    "Node conditional middleware guardrail failed open: {error}"
+                ));
+                None
+            })
     }))
-}
-
-#[cfg(test)]
-#[path = "../../tests/rust/api/conditional_gate_tests.rs"]
-mod conditional_gate_tests;
-
-fn node_event_sanitize_fn(env: &Env, func: &Function<JsArg, JsArg>) -> Result<EventSanitizeFn> {
-    // The registry and queued snapshots own the only callback references.
-    // PromiseAwareFn releases its TSFN on the last drop, so deregistration
-    // preserves already-snapshotted publication while still cleaning up
-    // deterministically once that work finishes.
-    let callback = Arc::new(crate::promise_call::PromiseAwareFn::new(env, func)?);
-    Ok(callable::wrap_js_event_sanitize_promise_fn(callback))
-}
-
-fn node_event_metadata_injector_fn(
-    env: &Env,
-    func: &Function<JsArg, JsArg>,
-) -> Result<EventMetadataInjectorFn> {
-    let callback = Arc::new(crate::promise_call::PromiseAwareFn::new(env, func)?);
-    Ok(callable::wrap_js_event_metadata_injector_promise_fn(
-        callback,
-    ))
 }
 
 fn node_llm_codec(
@@ -2005,8 +1467,8 @@ fn node_llm_codec(
             ));
         }
     };
-    let decode = callable::JsCodecCallback::new(env, decode, "JS codec decode callback failed")?;
-    let encode = callable::JsCodecCallback::new(env, encode, "JS codec encode callback failed")?;
+    let decode = callable::js_codec_callback(env, decode, "JS codec decode callback failed")?;
+    let encode = callable::js_codec_callback(env, encode, "JS codec encode callback failed")?;
     Ok(Some(callable::wrap_js_codec(decode, encode)))
 }
 
@@ -2016,54 +1478,17 @@ fn node_llm_response_codec(
 ) -> Result<Option<Arc<dyn nemo_relay::codec::traits::LlmResponseCodec>>> {
     Ok(decode
         .map(|decode| {
-            callable::JsCodecCallback::new(env, decode, "JS response codec decode callback failed")
+            callable::js_codec_callback(env, decode, "JS response codec decode callback failed")
                 .map(callable::wrap_js_response_codec)
         })
         .transpose()?)
 }
 
-const PLUGIN_VALIDATE_PREFIX: &str = "JS plugin validate callback failed";
-
-struct NodePluginValidateCallback {
-    direct: PersistentJsFunction<Json, JsArg>,
-    thread_safe: Tsfn<Json, Json, JsArg>,
-    registration_thread: std::thread::ThreadId,
-}
-
-impl NodePluginValidateCallback {
-    fn call(&self, plugin_config: Json) -> Result<Json> {
-        if std::thread::current().id() == self.registration_thread {
-            let env = self.direct.env();
-            let value = self.direct.function()?.call(plugin_config)?;
-            let envelope = unsafe { value.into_unknown(&env) };
-            return Ok(callable::unwrap_envelope(envelope, PLUGIN_VALIDATE_PREFIX)?);
-        }
-
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let status = self.thread_safe.call_with_return_value(
-            plugin_config,
-            ThreadsafeFunctionCallMode::NonBlocking,
-            move |value: napi::Result<JsArg>, env| {
-                let _ = tx.send(
-                    callable::tsfn_envelope(&env, value, PLUGIN_VALIDATE_PREFIX)
-                        .map_err(Error::from),
-                );
-                Ok(())
-            },
-        );
-        if status != napi::Status::Ok {
-            return Err(Error::generic_failure(format!(
-                "failed to queue JS plugin validate callback: {status:?}"
-            )));
-        }
-        rx.recv()
-            .map_err(|_| Error::generic_failure("JS plugin validate completion channel closed"))?
-    }
-}
+const PLUGIN_VALIDATE_PREFIX: &str = "JS plugin validate failed";
 
 struct NodePlugin {
     plugin_kind: String,
-    validate: Option<NodePluginValidateCallback>,
+    validate: Option<callable::SyncJsCallback<Json>>,
     register: Tsfn<NodePluginRegisterCall, JsArgs2, JsArg>,
 }
 
@@ -2092,12 +1517,12 @@ impl Plugin for NodePlugin {
                     }]
                 })
             }
-            Err(e) => vec![ConfigDiagnostic {
+            Err(error) => vec![ConfigDiagnostic {
                 level: DiagnosticLevel::Error,
                 code: "plugin.validate_failed".into(),
                 component: Some(self.plugin_kind.clone()),
                 field: None,
-                message: format!("JS plugin validate failed: {e}"),
+                message: error.to_string(),
             }],
         }
     }
@@ -2142,16 +1567,11 @@ impl Plugin for NodePlugin {
                     .map_err(|error| PluginError::RegistrationFailed(error.to_string()))
             };
             if let Err(error) = result {
-                let mut registrations = registrations
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                rollback_registrations(&mut registrations);
+                rollback_registrations(&mut lock(&registrations));
                 return Err(error);
             }
 
-            let drained = std::mem::take(&mut *registrations.lock().map_err(|e| {
-                PluginError::RegistrationFailed(format!("plugin registrations lock poisoned: {e}"))
-            })?);
+            let drained = std::mem::take(&mut *lock(&registrations));
             ctx.extend_registrations(drained);
             Ok(())
         })
@@ -2570,18 +1990,16 @@ pub fn test_closed_promise_aware_call<'env>(
     #[napi(ts_arg_type = "(...args: any[]) => any")] func: Callback,
     force_conversion_failure: Option<bool>,
 ) -> Result<PromiseRaw<'env, Json>> {
-    let promise_aware = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(env, &func)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
-    if !force_conversion_failure.unwrap_or(false) {
+    let promise_aware = Arc::new(PromiseAwareFn::new(env, &func)?);
+    let force_conversion_failure = force_conversion_failure.unwrap_or(false);
+    if !force_conversion_failure {
         promise_aware.close()?;
     }
 
     spawn_promise(
         env,
         async move {
-            if force_conversion_failure.unwrap_or(false) {
+            if force_conversion_failure {
                 promise_aware
                     .call_with_arg0(Box::new(|_| {
                         Err(napi::Error::from_reason(
@@ -2718,6 +2136,7 @@ pub fn with_scope<'env>(
     let attrs = ScopeAttributes::from_bits_truncate(attributes.unwrap_or(0));
     let publication_context_id = callback_factory::event_sanitizer_callback_context_id(env)?;
     let (scope_stack, publication_buffer) = effective_scope_context(env)?;
+    let pa_fn = Arc::new(PromiseAwareFn::new(env, &callback)?);
     let scope_handle = with_scope_stack_handle(scope_stack.clone(), || {
         with_nested_publication_buffer(publication_buffer.clone(), || {
             core_scope_api::push_scope(
@@ -2733,39 +2152,14 @@ pub fn with_scope<'env>(
             )
         })
     })
-    .map(ScopeHandle::from)
     .map_err(Error::from)?;
+    let scope_uuid = scope_handle.uuid;
 
-    let scope_uuid = scope_handle.inner.uuid;
     // Hand the callback a real `ScopeHandle` instance, matching the Rust,
     // Python bindings, so it can be passed back into `event`,
     // `toolCallExecute`, and `llmCallExecute`. The instance is materialized on
     // the JS thread because a `napi_wrap`'d handle cannot cross the
     // threadsafe-function boundary as plain JSON.
-    let callback_handle = scope_handle.inner.clone();
-
-    // Create a promise-aware wrapper so we handle both sync and async callbacks.
-    let error_publication_buffer = publication_buffer.clone();
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(env, &callback).map_err(|e| {
-            let status_message = format!("failed to create PromiseAwareFn: {e}");
-            let _ = with_scope_stack_handle(scope_stack.clone(), || {
-                with_nested_publication_buffer(error_publication_buffer.clone(), || {
-                    core_scope_api::pop_scope(
-                        core_scope_api::PopScopeParams::builder()
-                            .handle_uuid(&scope_uuid)
-                            .metadata_opt(Some(otel_status_metadata(
-                                "ERROR",
-                                Some(status_message.clone()),
-                            )))
-                            .build(),
-                    )
-                })
-            });
-            Error::generic_failure(status_message)
-        })?,
-    );
-
     spawn_promise(
         env,
         async move {
@@ -2777,7 +2171,7 @@ pub fn with_scope<'env>(
                         .scope(scope_stack, async move {
                             let build_handle: crate::promise_call::Arg0Builder =
                                 Box::new(move |env: &Env| {
-                                    js_value(env, ScopeHandle::from(callback_handle))
+                                    js_value(env, ScopeHandle::from(scope_handle))
                                 });
 
                             let result = pa_fn.call_with_arg0(build_handle).await;
@@ -2787,14 +2181,24 @@ pub fn with_scope<'env>(
                                     otel_status_metadata("ERROR", Some(error.to_string()))
                                 }
                             };
-                            // Always pop the scope, even on error.
-                            let _ = core_scope_api::pop_scope(
+                            let popped = core_scope_api::pop_scope(
                                 core_scope_api::PopScopeParams::builder()
                                     .handle_uuid(&scope_uuid)
                                     .metadata_opt(Some(metadata))
                                     .build(),
                             );
-                            result.map_err(Error::from)
+                            match (result, popped) {
+                                (Ok(value), Ok(())) => Ok(value),
+                                (Ok(_), Err(pop_error)) => Err(Error::from(pop_error)),
+                                (Err(error), popped) => {
+                                    if let Err(pop_error) = popped {
+                                        record_callback_error(format!(
+                                            "nemo_relay: failed to pop scope after a withScope callback failed: {pop_error}"
+                                        ));
+                                    }
+                                    Err(Error::from(error))
+                                }
+                            }
                         })
                         .await
                 },
@@ -3048,13 +2452,9 @@ pub fn tool_call_execute_async<'env>(
         .map(|h| h.inner.clone())
         .unwrap_or_else(|| effective_scope_top(&scope_stack));
 
-    // Create promise-aware wrapper — this must happen on the JS thread (we have Env).
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(env, &func)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
+    let pa_fn = Arc::new(PromiseAwareFn::new(env, &func)?);
 
-    let exec_fn: ToolExecutionNextFn = std::sync::Arc::new(move |args| {
+    let exec_fn: ToolExecutionNextFn = Arc::new(move |args| {
         let pa_fn = pa_fn.clone();
         Box::pin(async move {
             let result = pa_fn.call(args).await?;
@@ -3289,15 +2689,11 @@ pub fn llm_call_execute_async<'env>(
         .unwrap_or_else(|| effective_scope_top(&scope_stack));
     let llm_request: LlmRequest = serde_json::from_value(request)
         .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(env, &func)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
+    let pa_fn = Arc::new(PromiseAwareFn::new(env, &func)?);
 
-    let exec_fn: LlmExecutionNextFn = std::sync::Arc::new(move |req| {
+    let exec_fn: LlmExecutionNextFn = Arc::new(move |request| {
         let pa_fn = pa_fn.clone();
-        let req_json = serde_json::to_value(&req).unwrap_or(Json::Null);
-        Box::pin(async move { pa_fn.call(req_json).await })
+        Box::pin(async move { pa_fn.call(serialize_llm_request(&request)?).await })
     });
 
     let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
@@ -3401,9 +2797,8 @@ pub fn llm_stream_call_execute<'env>(
         None => LlmFinalizer::from(|| Json::Null),
     };
 
-    let provider = Arc::new(PromiseAwareFn::new(env, &func)?);
     let producers = crate::promise_call::StreamCancellation::default();
-    let default_fn = callable::wrap_js_llm_stream_fn(provider, producers.clone());
+    let default_fn = callable::wrap_js_llm_stream_fn(env, &func, producers.clone())?;
 
     let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
     let response_codec = node_llm_response_codec(env, response_codec_decode.as_deref())?;
@@ -3472,7 +2867,7 @@ pub fn register_event_metadata_injector(
     core_registry_api::register_event_metadata_injector(
         &name,
         priority,
-        node_event_metadata_injector_fn(&env, &injector)?,
+        callable::wrap_js_event_metadata_injector_promise_fn(&env, &injector)?,
     )
     .map_err(Error::from)
 }
@@ -3660,24 +3055,11 @@ pub fn register_conditional_middleware_guardrail(
     guardrail: Callback,
 ) -> Result<()> {
     let selected = kinds.into_iter().map(Into::into).collect::<BTreeSet<_>>();
-    let callback = node_conditional_middleware_guardrail(&env, &guardrail)?;
     core_registry_api::register_conditional_middleware_guardrail(
         &name,
         selected,
         &registration_name,
-        Arc::new(move |kinds, effective_name| {
-            callback
-                .call(
-                    kinds.iter().map(|kind| kind.as_str().to_string()).collect(),
-                    effective_name.to_string(),
-                )
-                .unwrap_or_else(|error| {
-                    record_callback_error(format!(
-                        "Node conditional middleware guardrail failed open: {error}"
-                    ));
-                    None
-                })
-        }),
+        node_conditional_middleware_guardrail(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -3719,8 +3101,12 @@ macro_rules! napi_event_guardrail_api {
             )]
             guardrail: Callback,
         ) -> Result<()> {
-            $core_register(&name, priority, node_event_sanitize_fn(&env, &guardrail)?)
-                .map_err(Error::from)
+            $core_register(
+                &name,
+                priority,
+                callable::wrap_js_event_sanitize_promise_fn(&env, &guardrail)?,
+            )
+            .map_err(Error::from)
         }
 
         #[napi(catch_unwind)]
@@ -3766,11 +3152,10 @@ macro_rules! napi_guardrail_tool_api {
             )]
             guardrail: Callback,
         ) -> Result<()> {
-            let callback = Arc::new(PromiseAwareFn::new(&env, &guardrail)?);
             $core_register(
                 &name,
                 priority,
-                callable::wrap_js_tool_sanitize_promise_fn(callback),
+                callable::wrap_js_tool_sanitize_promise_fn(&env, &guardrail)?,
             )
             .map_err(Error::from)
         }
@@ -3830,15 +3215,10 @@ pub fn register_tool_conditional_execution_guardrail(
     )]
     guardrail: Callback,
 ) -> Result<()> {
-    let callback = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &guardrail).map_err(|error| {
-            Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-        })?,
-    );
     core_registry_api::register_tool_conditional_execution_guardrail(
         &name,
         priority,
-        callable::wrap_js_tool_conditional_promise_fn(callback),
+        callable::wrap_js_tool_conditional_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -3871,16 +3251,11 @@ macro_rules! napi_intercept_tool_api {
             )]
             callable: Callback,
         ) -> Result<()> {
-            let callback = std::sync::Arc::new(
-                crate::promise_call::PromiseAwareFn::new(&env, &callable).map_err(|error| {
-                    Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-                })?,
-            );
             $core_register(
                 &name,
                 priority,
                 break_chain,
-                callable::wrap_js_tool_request_intercept_promise_fn(callback),
+                callable::wrap_js_tool_request_intercept_promise_fn(&env, &callable)?,
             )
             .map_err(Error::from)
         }
@@ -3925,17 +3300,12 @@ pub fn register_tool_execution_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
     core_registry_api::register_tool_execution_intercept(
         &name,
         priority,
-        callable::wrap_js_tool_exec_intercept_fn(pa_fn.clone()),
+        callable::wrap_js_tool_exec_intercept_fn(&env, &callable)?,
     )
-    .map_err(Error::from)?;
-    Ok(())
+    .map_err(Error::from)
 }
 
 /// Deregister a tool execution intercept by name.
@@ -3970,9 +3340,7 @@ pub fn register_llm_sanitize_request_guardrail(
     core_registry_api::register_llm_sanitize_request_guardrail(
         &name,
         priority,
-        callable::wrap_js_llm_sanitize_request_promise_fn(Arc::new(PromiseAwareFn::new(
-            &env, &guardrail,
-        )?)),
+        callable::wrap_js_llm_sanitize_request_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -4004,9 +3372,7 @@ pub fn register_llm_sanitize_response_guardrail(
     core_registry_api::register_llm_sanitize_response_guardrail(
         &name,
         priority,
-        callable::wrap_js_llm_sanitize_response_promise_fn(Arc::new(PromiseAwareFn::new(
-            &env, &guardrail,
-        )?)),
+        callable::wrap_js_llm_sanitize_response_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -4032,15 +3398,10 @@ pub fn register_llm_conditional_execution_guardrail(
     #[napi(ts_arg_type = "(request: Json) => string | null | Promise<string | null>")]
     guardrail: Callback,
 ) -> Result<()> {
-    let callback = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &guardrail).map_err(|error| {
-            Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-        })?,
-    );
     core_registry_api::register_llm_conditional_execution_guardrail(
         &name,
         priority,
-        callable::wrap_js_llm_conditional_promise_fn(callback),
+        callable::wrap_js_llm_conditional_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -4074,16 +3435,11 @@ pub fn register_llm_request_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let callback = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable).map_err(|error| {
-            Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-        })?,
-    );
     core_registry_api::register_llm_request_intercept(
         &name,
         priority,
         break_chain,
-        callable::wrap_js_llm_request_intercept_promise_fn(callback),
+        callable::wrap_js_llm_request_intercept_promise_fn(&env, &callable)?,
     )
     .map_err(Error::from)
 }
@@ -4113,17 +3469,12 @@ pub fn register_llm_execution_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
     core_registry_api::register_llm_execution_intercept(
         &name,
         priority,
-        callable::wrap_js_llm_exec_intercept_fn(pa_fn.clone()),
+        callable::wrap_js_llm_exec_intercept_fn(&env, &callable)?,
     )
-    .map_err(Error::from)?;
-    Ok(())
+    .map_err(Error::from)
 }
 
 /// Deregister an LLM execution intercept by name.
@@ -4155,17 +3506,12 @@ pub fn register_llm_stream_execution_intercept(
     )]
     callable: Callback,
 ) -> Result<()> {
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
     core_registry_api::register_llm_stream_execution_intercept(
         &name,
         priority,
-        callable::wrap_js_llm_stream_exec_intercept_fn(pa_fn.clone()),
+        callable::wrap_js_llm_stream_exec_intercept_fn(&env, &callable)?,
     )
-    .map_err(Error::from)?;
-    Ok(())
+    .map_err(Error::from)
 }
 
 /// Deregister an LLM stream execution intercept by name.
@@ -4229,8 +3575,8 @@ pub fn flush_subscribers<'env>(env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
                 return Ok(());
             }
             tokio::task::spawn_blocking(|| {
-                core_subscriber_api::flush_subscribers()?;
-                callable::flush_js_subscriber_callbacks()
+                core_subscriber_api::flush_subscribers()
+                    .map(|()| callable::flush_js_subscriber_callbacks())
             })
             .await
             .map_err(|error| Error::from(FlowError::Internal(error.to_string())))?
@@ -4260,7 +3606,7 @@ pub fn scope_register_event_metadata_injector(
         &uuid,
         &name,
         priority,
-        node_event_metadata_injector_fn(&env, &injector)?,
+        callable::wrap_js_event_metadata_injector_promise_fn(&env, &injector)?,
     )
     .map_err(Error::from)
 }
@@ -4300,7 +3646,7 @@ macro_rules! napi_scope_event_guardrail_api {
                 &uuid,
                 &name,
                 priority,
-                node_event_sanitize_fn(&env, &guardrail)?,
+                callable::wrap_js_event_sanitize_promise_fn(&env, &guardrail)?,
             )
             .map_err(Error::from)
         }
@@ -4351,12 +3697,11 @@ macro_rules! napi_scope_guardrail_tool_api {
         ) -> Result<()> {
             let uuid = uuid::Uuid::parse_str(&scope_uuid)
                 .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
-            let callback = Arc::new(PromiseAwareFn::new(&env, &guardrail)?);
             $core_register(
                 &uuid,
                 &name,
                 priority,
-                callable::wrap_js_tool_sanitize_promise_fn(callback),
+                callable::wrap_js_tool_sanitize_promise_fn(&env, &guardrail)?,
             )
             .map_err(Error::from)
         }
@@ -4427,11 +3772,7 @@ pub fn scope_register_tool_conditional_execution_guardrail(
         &uuid,
         &name,
         priority,
-        callable::wrap_js_tool_conditional_promise_fn(std::sync::Arc::new(
-            crate::promise_call::PromiseAwareFn::new(&env, &guardrail).map_err(|error| {
-                Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-            })?,
-        )),
+        callable::wrap_js_tool_conditional_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -4473,17 +3814,12 @@ macro_rules! napi_scope_intercept_tool_api {
         ) -> Result<()> {
             let uuid = uuid::Uuid::parse_str(&scope_uuid)
                 .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
-            let callback = std::sync::Arc::new(
-                crate::promise_call::PromiseAwareFn::new(&env, &callable).map_err(|error| {
-                    Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-                })?,
-            );
             $core_register(
                 &uuid,
                 &name,
                 priority,
                 break_chain,
-                callable::wrap_js_tool_request_intercept_promise_fn(callback),
+                callable::wrap_js_tool_request_intercept_promise_fn(&env, &callable)?,
             )
             .map_err(Error::from)
         }
@@ -4533,18 +3869,13 @@ pub fn scope_register_tool_execution_intercept(
 ) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(&scope_uuid)
         .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
     core_registry_api::scope_register_tool_execution_intercept(
         &uuid,
         &name,
         priority,
-        callable::wrap_js_tool_exec_intercept_fn(pa_fn.clone()),
+        callable::wrap_js_tool_exec_intercept_fn(&env, &callable)?,
     )
-    .map_err(Error::from)?;
-    Ok(())
+    .map_err(Error::from)
 }
 
 /// Deregister a scope-local tool execution intercept by name.
@@ -4587,9 +3918,7 @@ pub fn scope_register_llm_sanitize_request_guardrail(
         &uuid,
         &name,
         priority,
-        callable::wrap_js_llm_sanitize_request_promise_fn(Arc::new(PromiseAwareFn::new(
-            &env, &guardrail,
-        )?)),
+        callable::wrap_js_llm_sanitize_request_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -4632,9 +3961,7 @@ pub fn scope_register_llm_sanitize_response_guardrail(
         &uuid,
         &name,
         priority,
-        callable::wrap_js_llm_sanitize_response_promise_fn(Arc::new(PromiseAwareFn::new(
-            &env, &guardrail,
-        )?)),
+        callable::wrap_js_llm_sanitize_response_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -4673,11 +4000,7 @@ pub fn scope_register_llm_conditional_execution_guardrail(
         &uuid,
         &name,
         priority,
-        callable::wrap_js_llm_conditional_promise_fn(std::sync::Arc::new(
-            crate::promise_call::PromiseAwareFn::new(&env, &guardrail).map_err(|error| {
-                Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-            })?,
-        )),
+        callable::wrap_js_llm_conditional_promise_fn(&env, &guardrail)?,
     )
     .map_err(Error::from)
 }
@@ -4720,17 +4043,12 @@ pub fn scope_register_llm_request_intercept(
 ) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(&scope_uuid)
         .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
-    let callback = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable).map_err(|error| {
-            Error::generic_failure(format!("failed to create PromiseAwareFn: {error}"))
-        })?,
-    );
     core_registry_api::scope_register_llm_request_intercept(
         &uuid,
         &name,
         priority,
         break_chain,
-        callable::wrap_js_llm_request_intercept_promise_fn(callback),
+        callable::wrap_js_llm_request_intercept_promise_fn(&env, &callable)?,
     )
     .map_err(Error::from)
 }
@@ -4765,18 +4083,13 @@ pub fn scope_register_llm_execution_intercept(
 ) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(&scope_uuid)
         .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
     core_registry_api::scope_register_llm_execution_intercept(
         &uuid,
         &name,
         priority,
-        callable::wrap_js_llm_exec_intercept_fn(pa_fn.clone()),
+        callable::wrap_js_llm_exec_intercept_fn(&env, &callable)?,
     )
-    .map_err(Error::from)?;
-    Ok(())
+    .map_err(Error::from)
 }
 
 /// Deregister a scope-local LLM execution intercept by name.
@@ -4813,18 +4126,13 @@ pub fn scope_register_llm_stream_execution_intercept(
 ) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(&scope_uuid)
         .map_err(|e| Error::invalid_argument(format!("invalid UUID: {e}")))?;
-    let pa_fn = std::sync::Arc::new(
-        crate::promise_call::PromiseAwareFn::new(&env, &callable)
-            .map_err(|e| Error::generic_failure(format!("failed to create PromiseAwareFn: {e}")))?,
-    );
     core_registry_api::scope_register_llm_stream_execution_intercept(
         &uuid,
         &name,
         priority,
-        callable::wrap_js_llm_stream_exec_intercept_fn(pa_fn.clone()),
+        callable::wrap_js_llm_stream_exec_intercept_fn(&env, &callable)?,
     )
-    .map_err(Error::from)?;
-    Ok(())
+    .map_err(Error::from)
 }
 
 /// Deregister a scope-local LLM stream execution intercept by name.
@@ -5654,10 +4962,25 @@ enum NodeAdaptiveRuntimeState {
     Ready(CoreAdaptiveRuntime),
 }
 
+const ADAPTIVE_RUNTIME_LOCKED: &str =
+    "adaptive runtime is locked by an async operation; try again after await completes";
+const ADAPTIVE_RUNTIME_SHUT_DOWN: &str = "adaptive runtime already shut down";
+
 /// Owned adaptive runtime that can register adaptive features outside the plugin system.
 #[napi]
 pub struct AdaptiveRuntime {
     inner: Arc<tokio::sync::Mutex<Option<NodeAdaptiveRuntimeState>>>,
+}
+
+impl AdaptiveRuntime {
+    fn state(&self) -> Result<tokio::sync::MappedMutexGuard<'_, NodeAdaptiveRuntimeState>> {
+        let guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| Error::generic_failure(ADAPTIVE_RUNTIME_LOCKED))?;
+        tokio::sync::MutexGuard::try_map(guard, Option::as_mut)
+            .map_err(|_| Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN))
+    }
 }
 
 #[napi]
@@ -5690,12 +5013,11 @@ impl AdaptiveRuntime {
         spawn_promise(
             env,
             async move {
-                let state = {
-                    let mut guard = inner.lock().await;
-                    guard.take().ok_or_else(|| {
-                        Error::generic_failure("adaptive runtime already shut down")
-                    })?
-                };
+                let state = inner
+                    .lock()
+                    .await
+                    .take()
+                    .ok_or_else(|| Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN))?;
 
                 let (result, next_state) = match state {
                     NodeAdaptiveRuntimeState::Pending { config, report } => {
@@ -5727,15 +5049,7 @@ impl AdaptiveRuntime {
     /// Deregister all previously registered adaptive runtime features.
     #[napi(catch_unwind)]
     pub fn deregister(&self) -> Result<()> {
-        let mut guard = self.inner.try_lock().map_err(|_| {
-            Error::generic_failure(
-                "adaptive runtime is locked by an async operation; try again after await completes",
-            )
-        })?;
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| Error::generic_failure("adaptive runtime already shut down"))?;
-        match state {
+        match &mut *self.state()? {
             NodeAdaptiveRuntimeState::Pending { .. } => Ok(()),
             NodeAdaptiveRuntimeState::Ready(runtime) => runtime.deregister().map_err(Error::from),
         }
@@ -5748,12 +5062,11 @@ impl AdaptiveRuntime {
         spawn_promise(
             env,
             async move {
-                let state = {
-                    let mut guard = inner.lock().await;
-                    guard.take().ok_or_else(|| {
-                        Error::generic_failure("adaptive runtime already shut down")
-                    })?
-                };
+                let state = inner
+                    .lock()
+                    .await
+                    .take()
+                    .ok_or_else(|| Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN))?;
                 match state {
                     NodeAdaptiveRuntimeState::Pending { .. } => Ok(()),
                     NodeAdaptiveRuntimeState::Ready(runtime) => {
@@ -5768,15 +5081,7 @@ impl AdaptiveRuntime {
     /// Block until the telemetry drain has processed pending events.
     #[napi(js_name = "waitForIdle", catch_unwind)]
     pub fn wait_for_idle(&self) -> Result<()> {
-        let guard = self.inner.try_lock().map_err(|_| {
-            Error::generic_failure(
-                "adaptive runtime is locked by an async operation; try again after await completes",
-            )
-        })?;
-        let state = guard
-            .as_ref()
-            .ok_or_else(|| Error::generic_failure("adaptive runtime already shut down"))?;
-        match state {
+        match &*self.state()? {
             NodeAdaptiveRuntimeState::Pending { .. } => Ok(()),
             NodeAdaptiveRuntimeState::Ready(runtime) => {
                 runtime.wait_for_idle();
@@ -5788,15 +5093,8 @@ impl AdaptiveRuntime {
     /// Return the validation report captured during runtime construction.
     #[napi(catch_unwind)]
     pub fn report(&self) -> Result<Json> {
-        let guard = self.inner.try_lock().map_err(|_| {
-            Error::generic_failure(
-                "adaptive runtime is locked by an async operation; try again after await completes",
-            )
-        })?;
-        let state = guard
-            .as_ref()
-            .ok_or_else(|| Error::generic_failure("adaptive runtime already shut down"))?;
-        let report = match state {
+        let state = self.state()?;
+        let report = match &*state {
             NodeAdaptiveRuntimeState::Pending { report, .. } => report,
             NodeAdaptiveRuntimeState::Ready(runtime) => runtime.report(),
         };
@@ -5806,15 +5104,7 @@ impl AdaptiveRuntime {
     /// Bind the runtime's ACG request rewrite to a scope.
     #[napi(js_name = "bindScope", catch_unwind)]
     pub fn bind_scope(&self, scope_handle: &ScopeHandle) -> Result<()> {
-        let mut guard = self.inner.try_lock().map_err(|_| {
-            Error::generic_failure(
-                "adaptive runtime is locked by an async operation; try again after await completes",
-            )
-        })?;
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| Error::generic_failure("adaptive runtime already shut down"))?;
-        match state {
+        match &mut *self.state()? {
             NodeAdaptiveRuntimeState::Pending { .. } => Err(Error::generic_failure(
                 "adaptive runtime must be registered before binding ACG request intercepts",
             )),
@@ -5835,15 +5125,7 @@ impl AdaptiveRuntime {
             serde_json::from_value(options.annotated_request).map_err(|error| {
                 Error::invalid_argument(format!("invalid annotatedRequest: {error}"))
             })?;
-        let guard = self.inner.try_lock().map_err(|_| {
-            Error::generic_failure(
-                "adaptive runtime is locked by an async operation; try again after await completes",
-            )
-        })?;
-        let state = guard
-            .as_ref()
-            .ok_or_else(|| Error::generic_failure("adaptive runtime already shut down"))?;
-        match state {
+        match &*self.state()? {
             NodeAdaptiveRuntimeState::Pending { .. } => Err(Error::generic_failure(
                 "adaptive runtime must be registered before building cache request facts",
             )),
@@ -5971,23 +5253,16 @@ pub fn register_plugin(
     #[napi(ts_arg_type = "(...args: any[]) => any | undefined | null")] validate: Option<Callback>,
     #[napi(ts_arg_type = "(...args: any[]) => any")] register: Callback,
 ) -> Result<()> {
-    let validate_callback = match validate {
-        Some(func) => {
-            let callback: Function<Json, JsArg> =
-                callback_factory::wrap_middleware_callback(&env, &func)?;
-            let direct = PersistentJsFunction::new(&env, &callback)?;
-            let thread_safe = callback
-                .build_threadsafe_function::<Json>()
-                .weak::<true>()
-                .build_callback(|ctx: ThreadsafeCallContext<Json>| Ok(ctx.value))?;
-            Some(NodePluginValidateCallback {
-                direct,
-                thread_safe,
-                registration_thread: std::thread::current().id(),
-            })
-        }
-        None => None,
-    };
+    let validate = validate
+        .map(|func| {
+            callable::SyncJsCallback::new(
+                &env,
+                callback_factory::wrap_middleware_callback(&env, &func)?,
+                PLUGIN_VALIDATE_PREFIX,
+                None,
+            )
+        })
+        .transpose()?;
     let register: Function<JsArgs2, JsArg> =
         callback_factory::wrap_middleware_callback(&env, &register)?;
     let register_tsfn = register
@@ -6008,7 +5283,7 @@ pub fn register_plugin(
 
     register_plugin_impl(Arc::new(NodePlugin {
         plugin_kind,
-        validate: validate_callback,
+        validate,
         register: register_tsfn,
     }))
     .map_err(Error::from)
@@ -6056,23 +5331,14 @@ impl DynamicPluginCloseState {
     }
 
     fn report(&self) -> PluginHostReport {
-        let latest = {
-            let status = self
-                .status
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match &*status {
-                DynamicPluginCloseStatus::Active(activation) => activation
-                    .as_ref()
-                    .as_ref()
-                    .map(CorePluginHostActivation::report),
-                DynamicPluginCloseStatus::Closing | DynamicPluginCloseStatus::Closed => None,
-            }
+        let latest = match &*lock(&self.status) {
+            DynamicPluginCloseStatus::Active(activation) => activation
+                .as_ref()
+                .as_ref()
+                .map(CorePluginHostActivation::report),
+            DynamicPluginCloseStatus::Closing | DynamicPluginCloseStatus::Closed => None,
         };
-        let mut report = self
-            .report
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut report = lock(&self.report);
         if let Some(latest) = latest {
             *report = latest;
         }
@@ -6080,11 +5346,7 @@ impl DynamicPluginCloseState {
     }
 
     fn active(&self) -> bool {
-        let status = self
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match &*status {
+        match &*lock(&self.status) {
             DynamicPluginCloseStatus::Active(activation) => activation.as_ref().is_some(),
             DynamicPluginCloseStatus::Closing | DynamicPluginCloseStatus::Closed => false,
         }
@@ -6092,17 +5354,11 @@ impl DynamicPluginCloseState {
 
     fn begin_close(self: &Arc<Self>, log_finalizer_error: bool) {
         let activation = {
-            let mut status = self
-                .status
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut status = lock(&self.status);
             match &mut *status {
                 DynamicPluginCloseStatus::Active(activation) => {
                     if let Some(current) = activation.as_ref().as_ref() {
-                        *self
-                            .report
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = current.report();
+                        *lock(&self.report) = current.report();
                     }
                     let activation = activation.as_mut().take();
                     if activation.is_some() {
@@ -6126,10 +5382,7 @@ impl DynamicPluginCloseState {
         let spawn = std::thread::Builder::new()
             .name("nemo-relay-node-plugin-teardown".into())
             .spawn(move || {
-                let activation = worker_activation
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
+                let activation = lock(&worker_activation).take();
                 let (activation, result) = match activation {
                     Some(mut activation) => {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6138,10 +5391,7 @@ impl DynamicPluginCloseState {
                         .map_err(|_| Error::generic_failure("plugin host teardown task panicked"))
                         .and_then(|result| result.map_err(Error::from))
                         .map_err(Arc::new);
-                        *close_state
-                            .report
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = activation.report();
+                        *lock(&close_state.report) = activation.report();
                         (Some(activation), result)
                     }
                     None => (
@@ -6158,10 +5408,7 @@ impl DynamicPluginCloseState {
             });
 
         if let Err(error) = spawn {
-            let activation = activation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            let activation = lock(&activation).take();
             let error = Arc::new(Error::generic_failure(format!(
                 "failed to start dynamic plugin teardown task: {error}"
             )));
@@ -6197,10 +5444,7 @@ impl DynamicPluginCloseState {
             && activation
                 .as_ref()
                 .is_some_and(CorePluginHostActivation::is_active);
-        let mut status = self
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut status = lock(&self.status);
         *status = if retryable {
             DynamicPluginCloseStatus::Active(Box::new(activation))
         } else {
