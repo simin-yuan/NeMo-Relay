@@ -4707,21 +4707,97 @@ enum NodeAdaptiveRuntimeState {
 const ADAPTIVE_RUNTIME_LOCKED: &str =
     "adaptive runtime is locked by an async operation; try again after await completes";
 const ADAPTIVE_RUNTIME_SHUT_DOWN: &str = "adaptive runtime already shut down";
+const ADAPTIVE_RUNTIME_LIFECYCLE_STOPPED: &str = "adaptive runtime lifecycle task stopped";
+
+type SharedAdaptiveRuntimeState = Arc<tokio::sync::Mutex<Option<NodeAdaptiveRuntimeState>>>;
+
+type LifecycleReply = tokio::sync::oneshot::Sender<Result<()>>;
+
+enum LifecycleCommand {
+    Register(LifecycleReply),
+    Shutdown(LifecycleReply),
+}
+
+async fn run_adaptive_lifecycle(
+    state: SharedAdaptiveRuntimeState,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<LifecycleCommand>,
+) {
+    while let Some(command) = commands.recv().await {
+        let (reply, result) = {
+            let mut state = state.lock().await;
+            match command {
+                LifecycleCommand::Register(reply) => {
+                    (reply, register_adaptive_runtime(&mut state).await)
+                }
+                LifecycleCommand::Shutdown(reply) => {
+                    (reply, shutdown_adaptive_runtime(&mut state).await)
+                }
+            }
+        };
+        let _ = reply.send(result);
+    }
+}
+
+async fn register_adaptive_runtime(state: &mut Option<NodeAdaptiveRuntimeState>) -> Result<()> {
+    match state {
+        None => Err(Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN)),
+        Some(NodeAdaptiveRuntimeState::Pending { config, .. }) => {
+            let mut runtime = CoreAdaptiveRuntime::new(config.clone()).await?;
+            let registered = runtime.register().await.map_err(Error::from);
+            *state = Some(NodeAdaptiveRuntimeState::Ready(runtime));
+            registered
+        }
+        Some(NodeAdaptiveRuntimeState::Ready(runtime)) => {
+            runtime.register().await.map_err(Error::from)
+        }
+    }
+}
+
+async fn shutdown_adaptive_runtime(state: &mut Option<NodeAdaptiveRuntimeState>) -> Result<()> {
+    match state.take() {
+        None => Err(Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN)),
+        Some(NodeAdaptiveRuntimeState::Pending { .. }) => Ok(()),
+        Some(NodeAdaptiveRuntimeState::Ready(runtime)) => {
+            runtime.shutdown().await.map_err(Error::from)
+        }
+    }
+}
 
 /// Owned adaptive runtime that can register adaptive features outside the plugin system.
 #[napi]
 pub struct AdaptiveRuntime {
-    inner: Arc<tokio::sync::Mutex<Option<NodeAdaptiveRuntimeState>>>,
+    state: SharedAdaptiveRuntimeState,
+    commands: tokio::sync::mpsc::UnboundedSender<LifecycleCommand>,
 }
 
 impl AdaptiveRuntime {
     fn state(&self) -> Result<tokio::sync::MappedMutexGuard<'_, NodeAdaptiveRuntimeState>> {
         let guard = self
-            .inner
+            .state
             .try_lock()
             .map_err(|_| Error::generic_failure(ADAPTIVE_RUNTIME_LOCKED))?;
         tokio::sync::MutexGuard::try_map(guard, Option::as_mut)
             .map_err(|_| Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN))
+    }
+
+    fn lifecycle<'env>(
+        &self,
+        env: &'env Env,
+        command: fn(LifecycleReply) -> LifecycleCommand,
+    ) -> Result<PromiseRaw<'env, ()>> {
+        let (reply, completed) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(command(reply))
+            .map_err(|_| Error::generic_failure(ADAPTIVE_RUNTIME_LIFECYCLE_STOPPED))?;
+        spawn_promise(
+            env,
+            async move {
+                completed
+                    .await
+                    .map_err(|_| Error::generic_failure(ADAPTIVE_RUNTIME_LIFECYCLE_STOPPED))?
+            },
+            |env, ()| js_value(env, ()),
+        )
     }
 }
 
@@ -4735,54 +4811,22 @@ impl AdaptiveRuntime {
         let config: AdaptiveConfig = serde_json::from_value(config)
             .map_err(|error| Error::invalid_argument(error.to_string()))?;
         let report = validate_adaptive_config_or_err(&config)?;
-        Ok(Self {
-            inner: Arc::new(tokio::sync::Mutex::new(Some(
-                NodeAdaptiveRuntimeState::Pending { config, report },
-            ))),
-        })
+        let state = Arc::new(tokio::sync::Mutex::new(Some(
+            NodeAdaptiveRuntimeState::Pending { config, report },
+        )));
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        within_runtime_if_available(|| {
+            tokio::spawn(run_adaptive_lifecycle(Arc::clone(&state), receiver))
+        });
+        Ok(Self { state, commands })
     }
 
     /// Register all configured adaptive runtime features.
     ///
-    /// A `register()` or `shutdown()` call that overlaps another fails with
-    /// "adaptive runtime already shut down".
+    /// `register()` and `shutdown()` calls run one at a time in call order.
     #[napi(ts_return_type = "Promise<void>", catch_unwind)]
     pub fn register<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
-        let inner = self.inner.clone();
-        spawn_promise(
-            env,
-            async move {
-                let state = inner
-                    .lock()
-                    .await
-                    .take()
-                    .ok_or_else(|| Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN))?;
-
-                let (result, next_state) = match state {
-                    NodeAdaptiveRuntimeState::Pending { config, report } => {
-                        match CoreAdaptiveRuntime::new(config.clone()).await {
-                            Ok(mut runtime) => {
-                                let result = runtime.register().await.map_err(Error::from);
-                                (result, Some(NodeAdaptiveRuntimeState::Ready(runtime)))
-                            }
-                            Err(error) => (
-                                Err(Error::from(error)),
-                                Some(NodeAdaptiveRuntimeState::Pending { config, report }),
-                            ),
-                        }
-                    }
-                    NodeAdaptiveRuntimeState::Ready(mut runtime) => {
-                        let result = runtime.register().await.map_err(Error::from);
-                        (result, Some(NodeAdaptiveRuntimeState::Ready(runtime)))
-                    }
-                };
-
-                let mut guard = inner.lock().await;
-                *guard = next_state;
-                result
-            },
-            |env, _| js_value(env, ()),
-        )
+        self.lifecycle(env, LifecycleCommand::Register)
     }
 
     /// Deregister all previously registered adaptive runtime features.
@@ -4797,24 +4841,7 @@ impl AdaptiveRuntime {
     /// Shut down the adaptive runtime and consume its Rust runtime state.
     #[napi(ts_return_type = "Promise<void>", catch_unwind)]
     pub fn shutdown<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
-        let inner = self.inner.clone();
-        spawn_promise(
-            env,
-            async move {
-                let state = inner
-                    .lock()
-                    .await
-                    .take()
-                    .ok_or_else(|| Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN))?;
-                match state {
-                    NodeAdaptiveRuntimeState::Pending { .. } => Ok(()),
-                    NodeAdaptiveRuntimeState::Ready(runtime) => {
-                        runtime.shutdown().await.map_err(Error::from)
-                    }
-                }
-            },
-            |env, _| js_value(env, ()),
-        )
+        self.lifecycle(env, LifecycleCommand::Shutdown)
     }
 
     /// Block until the telemetry drain has processed pending events.
