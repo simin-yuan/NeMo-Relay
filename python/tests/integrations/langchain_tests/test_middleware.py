@@ -1857,72 +1857,146 @@ def test_structured_response_round_trip_serialization(use_async, kind, model_req
     assert result.structured_response == answer
 
 
-_CUT_TOOL_CALL = {"name": "write_file", "args": {"path": "report.txt", "content": "line 01\nline"}, "id": "call_1"}
+_CUT_ARGS = '{"path": "report.txt", "content": "line 01'
+_COMPLETE_ARGS = '{"path": "report.txt", "content": "line 01\\nline 02"}'
+_REPAIRED_ARGS = {"path": "report.txt", "content": "line 01"}
+
+
+def _tool_call_reply(raw_args: str, response_metadata: dict[str, Any] | None = None, *, streamed: bool = False) -> Any:
+    """A model reply that carries ``raw_args`` as its tool call's raw argument string.
+
+    ``streamed`` picks where LangChain keeps that string: a streamed reply keeps it on ``tool_call_chunks``, while a
+    reply the provider builds directly keeps it in ``additional_kwargs["tool_calls"]``. Either way the parsed
+    ``tool_calls`` entry holds the repaired dict a partial-JSON parser produced from it.
+    """
+    from langchain_core.messages import AIMessage, AIMessageChunk
+
+    metadata = response_metadata or {}
+    parsed = {} if raw_args.strip() in ("", "{}") else dict(_REPAIRED_ARGS)
+    if streamed:
+        return AIMessageChunk(
+            content="",
+            tool_call_chunks=[{"name": "write_file", "args": raw_args, "id": "call_1", "index": 0}],
+            response_metadata=metadata,
+        )
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "write_file", "args": parsed, "id": "call_1"}],
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": raw_args},
+                }
+            ]
+        },
+        response_metadata=metadata,
+    )
 
 
 def _tool_call_handler(
-    response_metadata: dict[str, Any],
+    raw_args: str,
+    response_metadata: dict[str, Any] | None = None,
+    *,
+    streamed: bool = False,
 ) -> Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]:
     from langchain.agents.middleware import ModelResponse
-    from langchain_core.messages import AIMessage
 
     async def handler(_request: ModelRequest[Any]) -> ModelResponse[Any]:
-        return ModelResponse(
-            result=[AIMessage(content="", tool_calls=[_CUT_TOOL_CALL], response_metadata=response_metadata)]
-        )
+        return ModelResponse(result=[_tool_call_reply(raw_args, response_metadata, streamed=streamed)])
 
     return handler
 
 
+@pytest.mark.parametrize("streamed", [False, True], ids=["provider_built", "streamed"])
 @pytest.mark.parametrize(
-    ("response_metadata", "reason"),
+    ("raw_args", "response_metadata", "reason"),
     [
-        pytest.param({"model_provider": "openai"}, "stream ended without finish_reason", id="openai_stream_ended"),
+        pytest.param(_CUT_ARGS, {}, "tool call arguments are not complete JSON (write_file)", id="cut_off_args"),
+        pytest.param(_COMPLETE_ARGS, {"finish_reason": "length"}, "finish_reason='length'", id="length"),
         pytest.param(
-            {"model_provider": "openai", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+            _COMPLETE_ARGS,
+            {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
             "status='incomplete'",
             id="responses_incomplete",
         ),
-        pytest.param({"model_provider": "openai", "finish_reason": "length"}, "finish_reason='length'", id="length"),
     ],
 )
 def test_awrap_model_call_rejects_cut_off_tool_calls(
     model_request: ModelRequest[Any],
     nemo_relay_middleware: NemoRelayMiddleware,
+    raw_args: str,
     response_metadata: dict[str, Any],
     reason: str,
+    streamed: bool,
 ) -> None:
     with pytest.raises(Exception, match="truncated") as exc_info:
-        asyncio.run(nemo_relay_middleware.awrap_model_call(model_request, _tool_call_handler(response_metadata)))
+        asyncio.run(
+            nemo_relay_middleware.awrap_model_call(
+                model_request, _tool_call_handler(raw_args, response_metadata, streamed=streamed)
+            )
+        )
     assert reason in str(exc_info.value)
 
 
+@pytest.mark.parametrize("streamed", [False, True], ids=["provider_built", "streamed"])
 @pytest.mark.parametrize(
-    "response_metadata",
+    ("raw_args", "response_metadata"),
     [
-        pytest.param({"model_provider": "openai", "finish_reason": "tool_calls"}, id="chat_complete"),
-        pytest.param({"model_provider": "openai", "status": "completed"}, id="responses_complete"),
-        pytest.param({}, id="mock_model_without_metadata"),
+        pytest.param(_COMPLETE_ARGS, {}, id="no_finish_reason_at_all"),
+        pytest.param(_COMPLETE_ARGS, {"finish_reason": "tool_calls"}, id="chat_complete"),
+        pytest.param(_COMPLETE_ARGS, {"finish_reason": "stop_sequence"}, id="unknown_finish_reason"),
+        pytest.param(_COMPLETE_ARGS, {"status": "completed"}, id="responses_complete"),
+        pytest.param("", {}, id="tool_without_arguments"),
+        pytest.param("{}", {}, id="tool_with_empty_object"),
     ],
 )
 def test_awrap_model_call_passes_complete_tool_calls(
     model_request: ModelRequest[Any],
     nemo_relay_middleware: NemoRelayMiddleware,
+    raw_args: str,
     response_metadata: dict[str, Any],
+    streamed: bool,
 ) -> None:
-    response = asyncio.run(nemo_relay_middleware.awrap_model_call(model_request, _tool_call_handler(response_metadata)))
+    """A reply whose arguments are complete runs whatever the provider reports about the end of the reply."""
+    response = asyncio.run(
+        nemo_relay_middleware.awrap_model_call(
+            model_request, _tool_call_handler(raw_args, response_metadata, streamed=streamed)
+        )
+    )
     assert response.result[0].tool_calls[0]["name"] == "write_file"
 
 
-def test_truncation_reason_uses_model_class_when_metadata_is_empty() -> None:
+def test_truncation_reason_reads_the_raw_arguments() -> None:
+    from nemo_relay.integrations.langchain.middleware import _truncation_reason
+
+    assert _truncation_reason(_tool_call_reply(_CUT_ARGS)) == "tool call arguments are not complete JSON (write_file)"
+    assert _truncation_reason(_tool_call_reply(_CUT_ARGS, streamed=True)) == (
+        "tool call arguments are not complete JSON (write_file)"
+    )
+    assert _truncation_reason(_tool_call_reply(_COMPLETE_ARGS)) is None
+    assert _truncation_reason(_tool_call_reply(_COMPLETE_ARGS, {"finish_reason": "length"})) == "finish_reason='length'"
+
+
+def test_truncation_reason_ignores_replies_without_tool_calls() -> None:
     from langchain_core.messages import AIMessage
 
     from nemo_relay.integrations.langchain.middleware import _truncation_reason
 
-    class ChatNVIDIA:  # stand-in with the class name of langchain_nvidia_ai_endpoints.ChatNVIDIA
-        pass
+    # A text reply has no arguments to inspect, and a missing finish_reason is not evidence of truncation.
+    assert _truncation_reason(AIMessage(content="the answer is 42")) is None
 
-    cut = AIMessage(content="", tool_calls=[_CUT_TOOL_CALL], response_metadata={})
-    assert _truncation_reason(cut, ChatNVIDIA()) == "stream ended without finish_reason"
-    assert _truncation_reason(cut, object()) is None
-    assert _truncation_reason(AIMessage(content="text only"), ChatNVIDIA()) is None
+
+def test_incomplete_tool_call_args_skips_parsed_arguments() -> None:
+    """A provider that hands LangChain an already-parsed value has no raw string to validate."""
+    from types import SimpleNamespace
+
+    from nemo_relay.integrations.langchain.middleware import _incomplete_tool_call_args
+
+    reply = SimpleNamespace(
+        tool_call_chunks=[{"name": "write_file", "args": {"path": "report.txt"}}, {"name": "write_file", "args": None}],
+        additional_kwargs={},
+    )
+
+    assert _incomplete_tool_call_args(reply) == []

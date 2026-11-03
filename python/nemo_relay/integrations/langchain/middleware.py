@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
@@ -43,42 +44,78 @@ def _schema_types(schema: Any) -> list[type[object]]:
     return []
 
 
-# Chat model classes whose complete replies always carry ``finish_reason`` (OpenAI wire format). ChatNVIDIA does not
-# set ``model_provider``, and when its stream ends early the accumulated metadata is empty.
-_FINISH_REASON_MODELS = frozenset({"ChatOpenAI", "AzureChatOpenAI", "ChatNVIDIA"})
+def _raw_argument_strings(message: Any) -> list[tuple[str, str]]:
+    """Return ``(name, raw argument string)`` for each tool call that still carries its raw string.
+
+    Where the raw string lives depends on how the reply was assembled: a streamed reply keeps it on
+    ``tool_call_chunks``, while a reply a provider builds directly keeps it in
+    ``additional_kwargs["tool_calls"][i]["function"]["arguments"]``.
+    """
+    raw: list[tuple[str, str]] = []
+    for call in getattr(message, "tool_call_chunks", None) or []:
+        arguments = call.get("args")
+        if isinstance(arguments, str):
+            raw.append((call.get("name") or "<unnamed>", arguments))
+    if raw:
+        return raw
+    for call in (getattr(message, "additional_kwargs", None) or {}).get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            raw.append((function.get("name") or "<unnamed>", arguments))
+    return raw
 
 
-def _truncation_reason(message: Any, model: Any) -> str | None:
+def _incomplete_tool_call_args(message: Any) -> list[str]:
+    """Return the names of tool calls whose raw argument string is not complete JSON.
+
+    LangChain builds streamed tool calls with a partial-JSON parser, so a call whose arguments stopped mid-stream
+    still arrives with a usable ``args`` dict and an empty ``invalid_tool_calls``: the raw string is the only place
+    the cut-off is still visible. An empty argument string or ``{}`` is complete for a tool that takes no arguments.
+    """
+    incomplete: list[str] = []
+    for name, arguments in _raw_argument_strings(message):
+        if arguments.strip() in ("", "{}"):
+            continue
+        try:
+            json.loads(arguments)
+        except ValueError:
+            incomplete.append(name)
+    return incomplete
+
+
+def _truncation_reason(message: Any) -> str | None:
     """Return why a reply with tool calls was cut off, or ``None`` if it ended normally.
 
-    LangChain builds streamed tool calls with a partial-JSON parser, so the arguments of a cut-off call still look
-    valid. A reply is cut off when it reports ``finish_reason="length"``, when the Responses API reports
-    ``status="incomplete"``, or when a model that always reports ``finish_reason`` sent neither ``finish_reason`` nor
-    ``status`` (the stream ended before its final event).
+    The arguments decide it: LangChain's partial-JSON parser turns a cut-off argument string into a usable ``args``
+    dict, so the raw string is the only trustworthy evidence, and it says nothing about the provider. Explicit
+    signals are still honored (``finish_reason="length"``, Responses ``status="incomplete"``). A missing
+    ``finish_reason`` is not evidence of truncation: providers are not required to report it, so treating absence as
+    truncation rejects every complete reply from a provider that omits it.
     """
     if not getattr(message, "tool_calls", None):
         return None
+    incomplete = _incomplete_tool_call_args(message)
+    if incomplete:
+        return f"tool call arguments are not complete JSON ({', '.join(incomplete)})"
     metadata = getattr(message, "response_metadata", None) or {}
-    finish_reason = metadata.get("finish_reason")
-    status = metadata.get("status")
-    if finish_reason == "length":
+    if metadata.get("finish_reason") == "length":
         return "finish_reason='length'"
-    if status == "incomplete":
+    if metadata.get("status") == "incomplete":
         details = metadata.get("incomplete_details") or {}
         reason = details.get("reason") if isinstance(details, dict) else None
         return f"status='incomplete', reason={reason!r}"
-    expects_finish_reason = metadata.get("model_provider") == "openai" or any(
-        cls.__name__ in _FINISH_REASON_MODELS for cls in type(model).__mro__
-    )
-    if finish_reason is None and status is None and expects_finish_reason:
-        return "stream ended without finish_reason"
     return None
 
 
-def _reject_truncated_tool_calls(response: Any, model: Any) -> None:
+def _reject_truncated_tool_calls(response: Any) -> None:
     """Raise before a cut-off tool call can reach a tool."""
     for message in getattr(response, "result", None) or []:
-        reason = _truncation_reason(message, model)
+        reason = _truncation_reason(message)
         if reason is not None:
             raise RuntimeError(f"LLM output truncated ({reason}); its tool calls were not executed")
 
@@ -148,7 +185,7 @@ class NemoRelayMiddleware(AgentMiddleware):
 
         async def _call(req: nemo_relay.LLMRequest) -> Any:
             response = handler(payload_to_model_request(request, req))
-            _reject_truncated_tool_calls(response, request.model)
+            _reject_truncated_tool_calls(response)
             return model_response_to_json(response, object_codec)
 
         result = run_sync(
@@ -172,7 +209,7 @@ class NemoRelayMiddleware(AgentMiddleware):
 
         async def _call(req: nemo_relay.LLMRequest) -> Any:
             response = await handler(payload_to_model_request(request, req))
-            _reject_truncated_tool_calls(response, request.model)
+            _reject_truncated_tool_calls(response)
             return model_response_to_json(response, object_codec)
 
         result = await self._llm_execute(
