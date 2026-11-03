@@ -20,6 +20,8 @@ use crate::error::{Error, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+pub(crate) type JsBuilder = Box<dyn FnOnce(&Env) -> napi::Result<JsArg> + Send>;
+
 #[derive(Clone, Copy)]
 pub(crate) struct JsArg {
     env: napi::sys::napi_env,

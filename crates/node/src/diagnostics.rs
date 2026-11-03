@@ -7,8 +7,15 @@ use napi_derive::napi;
 
 use crate::convert::{JAVASCRIPT_MAX_SAFE_INTEGER, js_value};
 use crate::error::{Error, Result};
-use nemo_relay_diagnostics::embedded::{self, EmbeddedDiagnosticsReader};
+use nemo_relay_diagnostics::embedded::{
+    self, EmbeddedDiagnosticError, EmbeddedDiagnosticPage, EmbeddedDiagnosticsReader,
+};
 use serde_json::Value as Json;
+
+type PageReader = fn(
+    &EmbeddedDiagnosticsReader,
+    &str,
+) -> std::result::Result<EmbeddedDiagnosticPage, EmbeddedDiagnosticError>;
 
 fn bounded_query(query: Option<JsString>) -> Result<String> {
     let Some(query) = query else {
@@ -77,19 +84,28 @@ fn native_value<'env>(env: &'env Env, value: &Json, field: &str) -> Result<Unkno
         _ => Ok(env.to_js_value(value)?),
     }
 }
+fn native_page<'env>(env: &'env Env, page: &EmbeddedDiagnosticPage) -> Result<Unknown<'env>> {
+    let value: Json = serde_json::from_str(page.as_str())
+        .map_err(|_| Error::generic_failure("invalid_snapshot"))?;
+    native_value(env, &value, "")
+}
 
 /// Authority to inspect restricted diagnostic evidence in the current process.
 #[napi]
 pub struct DiagnosticsReader {
     inner: EmbeddedDiagnosticsReader,
 }
+impl DiagnosticsReader {
+    fn page(&self, query: Option<JsString>, read: PageReader) -> Result<EmbeddedDiagnosticPage> {
+        read(&self.inner, &bounded_query(query)?).map_err(Error::from)
+    }
+}
 #[napi]
 impl DiagnosticsReader {
     /// Return canonical snake_case JSON with decimal-string diagnostic integers.
     #[napi(catch_unwind)]
     pub fn snapshot_json(&self, query_json: Option<JsString>) -> Result<String> {
-        let query = bounded_query(query_json)?;
-        let page = self.inner.snapshot_json(&query).map_err(Error::from)?;
+        let page = self.page(query_json, EmbeddedDiagnosticsReader::snapshot_json)?;
         Ok(page.as_str().to_owned())
     }
     /// Return a caller-owned camelCase object. Diagnostic u64 fields are always bigint.
@@ -100,20 +116,15 @@ impl DiagnosticsReader {
         env: &'env Env,
         query_json: Option<JsString>,
     ) -> Result<Unknown<'env>> {
-        let query = bounded_query(query_json)?;
-        let page = self.inner.snapshot_json(&query).map_err(Error::from)?;
-        let value: Json = serde_json::from_str(page.as_str())
-            .map_err(|_| Error::generic_failure("invalid_snapshot"))?;
-        native_value(env, &value, "")
+        native_page(
+            env,
+            &self.page(query_json, EmbeddedDiagnosticsReader::snapshot_json)?,
+        )
     }
     /// Return canonical snake_case JSON with decimal-string diagnostic integers.
     #[napi(catch_unwind)]
     pub fn inspect_memory_json(&self, query_json: Option<JsString>) -> Result<String> {
-        let query = bounded_query(query_json)?;
-        let page = self
-            .inner
-            .inspect_memory_json(&query)
-            .map_err(Error::from)?;
+        let page = self.page(query_json, EmbeddedDiagnosticsReader::inspect_memory_json)?;
         Ok(page.as_str().to_owned())
     }
     /// Return a caller-owned camelCase object. Diagnostic u64 fields are always bigint.
@@ -124,14 +135,10 @@ impl DiagnosticsReader {
         env: &'env Env,
         query_json: Option<JsString>,
     ) -> Result<Unknown<'env>> {
-        let query = bounded_query(query_json)?;
-        let page = self
-            .inner
-            .inspect_memory_json(&query)
-            .map_err(Error::from)?;
-        let value: Json = serde_json::from_str(page.as_str())
-            .map_err(|_| Error::generic_failure("invalid_snapshot"))?;
-        native_value(env, &value, "")
+        native_page(
+            env,
+            &self.page(query_json, EmbeddedDiagnosticsReader::inspect_memory_json)?,
+        )
     }
     /// Return independent core/adapter budgets, occupancy, and logging coverage.
     #[napi(ts_return_type = "object", catch_unwind)]

@@ -53,7 +53,32 @@ macro_rules! mirror_variants {
     };
 }
 
-pub(crate) use mirror_variants;
+macro_rules! mirror_fields {
+    ($local:ident <=> $core:ty { $($field:ident),+ $(,)? }) => {
+        mirror_fields!($local => $core { $($field),+ });
+        mirror_fields!($local <= $core { $($field),+ });
+    };
+    ($local:ident => $core:ty { $($field:ident),+ $(,)? }) => {
+        impl From<$local> for $core {
+            fn from(value: $local) -> Self {
+                Self {
+                    $($field: value.$field.into(),)+
+                }
+            }
+        }
+    };
+    ($local:ident <= $core:ty { $($field:ident),+ $(,)? }) => {
+        impl From<$core> for $local {
+            fn from(value: $core) -> Self {
+                Self {
+                    $($field: value.$field.into(),)+
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use {mirror_fields, mirror_variants};
 
 /// Identity of one visible Relay scope.
 #[napi(object)]
@@ -71,17 +96,18 @@ pub struct ScopeStackSnapshot {
     pub scopes: Vec<ScopeStackEntry>,
 }
 
+mirror_fields!(
+    ScopeStackEntry
+        <= nemo_relay_runtime::api::runtime::ScopeStackEntry {
+            scope_id,
+            scope_type,
+        }
+);
+
 impl From<nemo_relay_runtime::api::runtime::ScopeStackSnapshot> for ScopeStackSnapshot {
     fn from(snapshot: nemo_relay_runtime::api::runtime::ScopeStackSnapshot) -> Self {
         Self {
-            scopes: snapshot
-                .scopes
-                .into_iter()
-                .map(|scope| ScopeStackEntry {
-                    scope_id: scope.scope_id.to_string(),
-                    scope_type: scope.scope_type.into(),
-                })
-                .collect(),
+            scopes: snapshot.scopes.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -168,14 +194,7 @@ pub struct DataSchema {
     pub version: String,
 }
 
-impl From<DataSchema> for CoreDataSchema {
-    fn from(value: DataSchema) -> Self {
-        Self {
-            name: value.name,
-            version: value.version,
-        }
-    }
-}
+mirror_fields!(DataSchema => CoreDataSchema { name, version });
 
 /// One typed recording operation emitted by `metric`.
 #[napi(object)]
@@ -191,20 +210,9 @@ pub struct MetricMeasurement {
     pub boundaries: Option<Vec<f64>>,
 }
 
-impl From<MetricMeasurement> for CoreMetricMeasurement {
-    fn from(value: MetricMeasurement) -> Self {
-        Self {
-            name: value.name,
-            kind: value.kind.into(),
-            value_type: value.value_type.into(),
-            value: value.value,
-            unit: value.unit,
-            description: value.description,
-            attributes: value.attributes,
-            boundaries: value.boundaries,
-        }
-    }
-}
+mirror_fields!(MetricMeasurement => CoreMetricMeasurement {
+    name, kind, value_type, value, unit, description, attributes, boundaries,
+});
 
 /// Canonical application-visible result of tool execution.
 ///
@@ -225,14 +233,7 @@ impl From<ToolExecutionResult> for CoreToolExecutionResult {
     }
 }
 
-impl From<CoreToolExecutionResult> for ToolExecutionResult {
-    fn from(value: CoreToolExecutionResult) -> Self {
-        Self {
-            result: value.result,
-            annotation: value.annotation,
-        }
-    }
-}
+mirror_fields!(ToolExecutionResult <= CoreToolExecutionResult { result, annotation });
 
 /// Per-call context delivered to a tool execution intercept.
 ///
@@ -276,10 +277,7 @@ impl ScopeStack {
     /// Creates a new isolated scope stack with its own root scope.
     #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
-        Self {
-            inner: create_scope_stack(),
-            publication_buffer: None,
-        }
+        create_scope_stack().into()
     }
 }
 

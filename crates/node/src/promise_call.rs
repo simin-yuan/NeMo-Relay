@@ -26,7 +26,7 @@ use nemo_relay_types::error::{FlowError, Result as FlowResult};
 
 use crate::callback_factory::{self, CallbackScope, Settlers};
 use crate::convert::{
-    BoxFuture, HandledTsfn, JsArg, abort_tsfn, closure_function, detach, js_value, lock,
+    BoxFuture, HandledTsfn, JsArg, JsBuilder, abort_tsfn, closure_function, detach, js_value, lock,
     report_queue_status,
 };
 use crate::environment::{Liveness, create_promise, spawn_promise};
@@ -81,11 +81,9 @@ struct NextState {
     publication_context_id: Option<String>,
 }
 
-type Arg0Builder = Box<dyn FnOnce(&Env) -> napi::Result<JsArg> + Send>;
-
 enum PrimaryArg {
     Json(Json),
-    Build(Arg0Builder),
+    Build(JsBuilder),
 }
 
 #[must_use]
@@ -140,10 +138,8 @@ impl Invocation {
 
 struct InvokeArgs {
     call_id: u64,
-    arg0: PrimaryArg,
-    spread: bool,
+    invocation: Invocation,
     next: Option<NextState>,
-    publication: bool,
     publication_context_id: Option<String>,
     scope: CallbackScope,
     stream_result: bool,
@@ -520,7 +516,7 @@ fn push_stream_chunk(env: &Env, calls: &CallRegistry, call_id: u64, chunk: Json)
             let task = within_runtime_if_available(|| {
                 tokio::spawn(async move {
                     let _ = chunks.send(chunk).await;
-                    pending.resolve_with(|env| js_value(env, ()));
+                    pending.resolve_with(Box::new(|env| js_value(env, ())));
                 })
             });
             *lock(&stream.parked) = Some(task);
@@ -626,7 +622,7 @@ fn build_promise_args(
 }
 
 fn build_invoke_args(env: &Env, call: InvokeArgs, undefined: JsArg) -> napi::Result<PromiseArgs> {
-    let arg0 = match call.arg0 {
+    let arg0 = match call.invocation.arg0 {
         PrimaryArg::Json(value) => js_value(env, value)?,
         PrimaryArg::Build(build) => build(env)?,
     };
@@ -642,9 +638,9 @@ fn build_invoke_args(env: &Env, call: InvokeArgs, undefined: JsArg) -> napi::Res
         js_value(env, false)?,
         js_value(env, call.call_id as f64)?,
         arg0,
-        js_value(env, call.spread)?,
+        js_value(env, call.invocation.spread)?,
         next,
-        js_value(env, call.publication)?,
+        js_value(env, call.invocation.publication)?,
         publication_context_id,
         call.scope.into_js(env)?,
         js_value(env, call.stream_result)?,
@@ -713,12 +709,35 @@ impl PromiseAwareFn {
             .ok_or_else(closed_tsfn_error)
     }
 
-    fn next_state(&self, next: Option<NextFn>) -> Option<NextState> {
-        next.map(|next| NextState {
+    fn queue(
+        &self,
+        invocation: Invocation,
+        next: Option<NextFn>,
+        completion: CallCompletion,
+    ) -> FlowResult<(u64, Arc<PromiseTsfn>)> {
+        let tsfn = self.tsfn()?;
+        let call_id = self.calls.allocate();
+        let next = next.map(|next| NextState {
             next,
             continuation_context: MiddlewareContinuationContext::capture(),
             publication_context_id: publication_callback_context_id(),
-        })
+        });
+        let status = tsfn.call(
+            Ok(PromiseCall::Invoke(Box::new(CallArgs {
+                invoke: InvokeArgs {
+                    call_id,
+                    invocation,
+                    next,
+                    publication_context_id: publication_callback_context_id(),
+                    scope: CallbackScope::capture(),
+                    stream_result: matches!(completion, CallCompletion::Stream(_)),
+                },
+                completion,
+            }))),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        queue_status_result(status)?;
+        Ok((call_id, tsfn))
     }
 
     async fn call_stream_inner(
@@ -727,8 +746,6 @@ impl PromiseAwareFn {
         next: Option<JsonStreamNextFn>,
         stream_cancellation: Option<&StreamCancellation>,
     ) -> FlowResult<LlmJsonStream> {
-        let tsfn = self.tsfn()?;
-        let call_id = self.calls.allocate();
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let (chunk_sender, chunk_receiver) =
             tokio::sync::mpsc::channel(crate::api::LLM_STREAM_BRIDGE_CAPACITY);
@@ -741,26 +758,12 @@ impl PromiseAwareFn {
             finished: Arc::default(),
             parked: Mutex::new(None),
         });
-        let next = self.next_state(next.map(NextFn::Stream));
-        let status = tsfn.call(
-            Ok(PromiseCall::Invoke(Box::new(CallArgs {
-                invoke: InvokeArgs {
-                    call_id,
-                    arg0: invocation.arg0,
-                    spread: invocation.spread,
-                    next,
-                    publication: invocation.publication,
-                    publication_context_id: publication_callback_context_id(),
-                    scope: CallbackScope::capture(),
-                    stream_result: true,
-                },
-                completion: CallCompletion::Stream(Arc::clone(&completion)),
-            }))),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-        queue_status_result(status)?;
-        let cancellation =
-            CallCancellation::new(call_id, tsfn.clone(), Arc::clone(&completion.finished));
+        let (call_id, tsfn) = self.queue(
+            invocation,
+            next.map(NextFn::Stream),
+            CallCompletion::Stream(Arc::clone(&completion)),
+        )?;
+        let cancellation = CallCancellation::new(call_id, tsfn, Arc::clone(&completion.finished));
         if let Some(stream_cancellation) = stream_cancellation {
             stream_cancellation.attach(&cancellation);
         }
@@ -790,33 +793,18 @@ impl PromiseAwareFn {
     }
 
     async fn call_inner(&self, invocation: Invocation, next: Option<NextFn>) -> FlowResult<Json> {
-        let tsfn = self.tsfn()?;
-        let call_id = self.calls.allocate();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let finished = Arc::new(AtomicBool::new(false));
-        let next = self.next_state(next);
-        let status = tsfn.call(
-            Ok(PromiseCall::Invoke(Box::new(CallArgs {
-                invoke: InvokeArgs {
-                    call_id,
-                    arg0: invocation.arg0,
-                    spread: invocation.spread,
-                    next,
-                    publication: invocation.publication,
-                    publication_context_id: publication_callback_context_id(),
-                    scope: CallbackScope::capture(),
-                    stream_result: false,
-                },
-                completion: CallCompletion::Json(JsonCompletion {
-                    sender,
-                    finished: Arc::clone(&finished),
-                }),
-            }))),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-        queue_status_result(status)?;
+        let (call_id, tsfn) = self.queue(
+            invocation,
+            next,
+            CallCompletion::Json(JsonCompletion {
+                sender,
+                finished: Arc::clone(&finished),
+            }),
+        )?;
         let mut cancellation_guard =
-            CallCancellationGuard::new(CallCancellation::new(call_id, tsfn.clone(), finished));
+            CallCancellationGuard::new(CallCancellation::new(call_id, tsfn, finished));
 
         let result = receiver
             .await

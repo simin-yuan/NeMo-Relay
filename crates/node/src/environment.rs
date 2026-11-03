@@ -13,25 +13,13 @@ use napi::{Env, check_status};
 
 use crate::callback_factory::Factories;
 use crate::convert::{
-    JsArg, Tsfn, abort_tsfn, js_value, record_callback_error, report_queue_status,
+    JsArg, JsBuilder, Tsfn, abort_tsfn, js_value, record_callback_error, report_queue_status,
 };
 use crate::error::{Error, Result};
 
-pub(crate) type Settler = Box<dyn FnOnce(&Env) -> napi::Result<JsArg> + Send>;
-
-pub(crate) trait Rejection: Send + 'static {
-    fn settler(self) -> Settler;
-}
-
-impl Rejection for Error {
-    fn settler(self) -> Settler {
-        Box::new(move |env| js_value(env, self))
-    }
-}
-
-impl Rejection for Arc<Error> {
-    fn settler(self) -> Settler {
-        Box::new(move |env| js_value(env, self.to_napi()))
+impl From<Error> for JsBuilder {
+    fn from(error: Error) -> Self {
+        Box::new(move |env| js_value(env, error))
     }
 }
 
@@ -146,7 +134,7 @@ unsafe impl Send for Deferred {}
 
 struct Settlement {
     deferred: Deferred,
-    outcome: std::result::Result<Settler, Settler>,
+    outcome: std::result::Result<JsBuilder, JsBuilder>,
     settler: Arc<Tsfn<Settlement, ()>>,
     pending: Arc<AtomicUsize>,
     liveness: Liveness,
@@ -175,27 +163,26 @@ impl Settlement {
 fn settle_deferred(
     env: &Env,
     deferred: Deferred,
-    outcome: std::result::Result<Settler, Settler>,
+    outcome: std::result::Result<JsBuilder, JsBuilder>,
 ) -> napi::Result<()> {
-    let settled = match outcome {
-        Ok(resolve) => resolve(env).map(Ok),
-        Err(reject) => reject(env).map(Err),
+    let (resolve, built) = match outcome {
+        Ok(resolve) => (true, resolve(env)),
+        Err(reject) => (false, reject(env)),
     };
-    let status = match settled {
-        // SAFETY: the deferred was created in `env` and is settled exactly once here.
-        Ok(Ok(value)) => unsafe {
-            let value = JsArg::to_napi_value(env.raw(), value)?;
+    // SAFETY: `env` is the live environment of the calling JavaScript thread.
+    let (resolve, value) = unsafe {
+        match built {
+            Ok(value) => (resolve, JsArg::to_napi_value(env.raw(), value)?),
+            Err(error) => (false, napi::Error::to_napi_value(env.raw(), error)?),
+        }
+    };
+    // SAFETY: the deferred was created in `env` and is settled exactly once here.
+    let status = unsafe {
+        if resolve {
             napi::sys::napi_resolve_deferred(env.raw(), deferred.0, value)
-        },
-        Ok(Err(value)) => unsafe {
-            let value = JsArg::to_napi_value(env.raw(), value)?;
+        } else {
             napi::sys::napi_reject_deferred(env.raw(), deferred.0, value)
-        },
-        // SAFETY: as above.
-        Err(error) => unsafe {
-            let error = napi::Error::to_napi_value(env.raw(), error)?;
-            napi::sys::napi_reject_deferred(env.raw(), deferred.0, error)
-        },
+        }
     };
     check_status!(status, "settle promise failed")
 }
@@ -208,21 +195,15 @@ pub(crate) struct PendingPromise {
 }
 
 impl PendingPromise {
-    pub(crate) fn resolve_with(
-        mut self,
-        settler: impl FnOnce(&Env) -> napi::Result<JsArg> + Send + 'static,
-    ) {
-        self.send(Ok(Box::new(settler)));
+    pub(crate) fn resolve_with(mut self, build: JsBuilder) {
+        self.send(Ok(build));
     }
 
-    pub(crate) fn reject_with(
-        mut self,
-        settler: impl FnOnce(&Env) -> napi::Result<JsArg> + Send + 'static,
-    ) {
-        self.send(Err(Box::new(settler)));
+    pub(crate) fn reject_with(mut self, build: JsBuilder) {
+        self.send(Err(build));
     }
 
-    fn send(&mut self, outcome: std::result::Result<Settler, Settler>) {
+    fn send(&mut self, outcome: std::result::Result<JsBuilder, JsBuilder>) {
         let Some(deferred) = self.deferred.take() else {
             return;
         };
@@ -242,12 +223,10 @@ impl PendingPromise {
 
 impl Drop for PendingPromise {
     fn drop(&mut self) {
-        self.send(Err(Box::new(|env| {
-            js_value(
-                env,
-                Error::generic_failure("promise dropped before it settled"),
-            )
-        })));
+        self.send(Err(Error::generic_failure(
+            "promise dropped before it settled",
+        )
+        .into()));
     }
 }
 
@@ -281,7 +260,7 @@ pub(crate) fn spawn_promise<'env, V, T, E, F, R>(
 ) -> Result<PromiseRaw<'env, V>>
 where
     T: Send + 'static,
-    E: Rejection,
+    E: Into<JsBuilder> + Send + 'static,
     F: Future<Output = std::result::Result<T, E>> + Send + 'static,
     R: FnOnce(&Env, T) -> napi::Result<JsArg> + Send + 'static,
 {
@@ -289,8 +268,8 @@ where
     within_runtime_if_available(|| {
         tokio::spawn(async move {
             match future.await {
-                Ok(value) => pending.resolve_with(move |env| resolve(env, value)),
-                Err(error) => pending.reject_with(error.settler()),
+                Ok(value) => pending.resolve_with(Box::new(move |env| resolve(env, value))),
+                Err(error) => pending.reject_with(error.into()),
             }
         })
     });

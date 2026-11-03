@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeCallContext;
 use napi_derive::napi;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value as Json;
@@ -89,7 +89,7 @@ use crate::promise_call::{Invocation, PromiseAwareFn, PublicationContext};
 use crate::stream::LlmStream;
 use crate::types::{
     DataSchema, LlmHandle, LogSeverity, MetricMeasurement, MetricTemporality, ScopeHandle,
-    ScopeStack, ScopeType, ToolExecutionResult, ToolHandle, mirror_variants,
+    ScopeStack, ScopeType, ToolExecutionResult, ToolHandle, mirror_fields, mirror_variants,
 };
 
 #[cfg(test)]
@@ -138,27 +138,16 @@ pub fn log(
     nemo_relay_logging::emit_str(&level, &target, &message, fields).map_err(Error::from)
 }
 
-#[napi(catch_unwind)]
-pub fn trace(message: String, target: Option<String>, fields: Option<Json>) -> Result<()> {
-    log("trace".into(), message, target, fields)
-}
-#[napi(catch_unwind)]
-pub fn debug(message: String, target: Option<String>, fields: Option<Json>) -> Result<()> {
-    log("debug".into(), message, target, fields)
-}
-#[napi(catch_unwind)]
-pub fn info(message: String, target: Option<String>, fields: Option<Json>) -> Result<()> {
-    log("info".into(), message, target, fields)
-}
-#[napi(catch_unwind)]
-pub fn warn(message: String, target: Option<String>, fields: Option<Json>) -> Result<()> {
-    log("warn".into(), message, target, fields)
+macro_rules! log_levels {
+    ($($level:ident),*) => {$(
+        #[napi(catch_unwind)]
+        pub fn $level(message: String, target: Option<String>, fields: Option<Json>) -> Result<()> {
+            log(stringify!($level).into(), message, target, fields)
+        }
+    )*};
 }
 
-#[napi(catch_unwind)]
-pub fn error(message: String, target: Option<String>, fields: Option<Json>) -> Result<()> {
-    log("error".into(), message, target, fields)
-}
+log_levels!(trace, debug, info, warn, error);
 
 /// Acquire a fresh resource metrics snapshot without requiring polling.
 /// Collection runs outside the JavaScript event loop.
@@ -436,9 +425,9 @@ fn with_effective_scope_stack<T>(env: &Env, callback: impl FnOnce() -> T) -> Res
     Ok(with_callback_scope(&effective_scope(env)?, callback))
 }
 
-fn parse_scope_uuid(scope_uuid: &str) -> Result<uuid::Uuid> {
-    uuid::Uuid::parse_str(scope_uuid)
-        .map_err(|error| Error::invalid_argument(format!("invalid UUID: {error}")))
+fn parse_uuid(value: &str, what: &str) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(value)
+        .map_err(|error| Error::invalid_argument(format!("invalid {what}: {error}")))
 }
 
 struct CallContext {
@@ -625,14 +614,22 @@ fn completed_span_context_ttl(value: BigInt) -> Result<Duration> {
     Ok(Duration::from_millis(value))
 }
 
+macro_rules! option_setters {
+    ($config:ident, $options:ident; $($field:ident($value:ident) => $setter:ident($argument:expr);)*) => {$(
+        if let Some($value) = $options.$field {
+            $config = $config.$setter($argument);
+        }
+    )*};
+}
+
 macro_rules! endpoint_options {
     ($config:ident, $options:ident) => {
-        if let Some(transport) = $options.transport {
-            $config = $config.with_transport(parse_otel_transport(&transport)?);
-        }
-        if let Some(timeout) = $options.timeout_millis {
-            $config = $config.with_timeout(Duration::from_millis(timeout.into()));
-        }
+        option_setters!($config, $options;
+            transport(transport) => with_transport(parse_otel_transport(&transport)?);
+            timeout_millis(timeout) => with_timeout(Duration::from_millis(timeout.into()));
+            tls(tls) => with_tls(tls.into());
+            allow_insecure(allow_insecure) => with_allow_insecure(allow_insecure);
+        );
         $config = with_string_map(
             $config,
             $options.headers,
@@ -645,26 +642,16 @@ macro_rules! endpoint_options {
             "headerEnv",
             |config, key, variable| config.with_header_env(key, variable),
         )?;
-        if let Some(tls) = $options.tls {
-            $config = $config.with_tls(tls.into());
-        }
-        if let Some(allow_insecure) = $options.allow_insecure {
-            $config = $config.with_allow_insecure(allow_insecure);
-        }
     };
 }
 
 macro_rules! service_options {
     ($config:ident, $options:ident) => {
-        if let Some(namespace) = $options.service_namespace {
-            $config = $config.with_service_namespace(namespace);
-        }
-        if let Some(version) = $options.service_version {
-            $config = $config.with_service_version(version);
-        }
-        if let Some(scope) = $options.instrumentation_scope {
-            $config = $config.with_instrumentation_scope(scope);
-        }
+        option_setters!($config, $options;
+            service_namespace(namespace) => with_service_namespace(namespace);
+            service_version(version) => with_service_version(version);
+            instrumentation_scope(scope) => with_instrumentation_scope(scope);
+        );
         $config = with_string_map(
             $config,
             $options.resource_attributes,
@@ -676,24 +663,14 @@ macro_rules! service_options {
 
 macro_rules! trace_options {
     ($config:ident, $options:ident) => {
-        if let Some(ttl) = $options.completed_span_context_ttl_millis {
-            $config = $config.with_completed_span_context_ttl(completed_span_context_ttl(ttl)?);
-        }
-        if let Some(projection) = $options.mark_projection {
-            $config = $config.with_mark_projection(parse_mark_projection(projection)?);
-        }
-        if let Some(names) = $options.mark_exclude_names {
-            $config = $config.with_mark_exclude_names(names);
-        }
-        if let Some(mappings) = $options.attribute_mappings {
-            $config = $config.with_attribute_mappings(parse_attribute_mappings(mappings)?);
-        }
-        if let Some(prefixes) = $options.promote_metadata_prefixes {
-            $config = $config.with_promote_metadata_prefixes(prefixes);
-        }
-        if let Some(prefixes) = $options.promote_resource_metadata_prefixes {
-            $config = $config.with_promote_resource_metadata_prefixes(prefixes);
-        }
+        option_setters!($config, $options;
+            completed_span_context_ttl_millis(ttl) => with_completed_span_context_ttl(completed_span_context_ttl(ttl)?);
+            mark_projection(projection) => with_mark_projection(parse_mark_projection(projection)?);
+            mark_exclude_names(names) => with_mark_exclude_names(names);
+            attribute_mappings(mappings) => with_attribute_mappings(parse_attribute_mappings(mappings)?);
+            promote_metadata_prefixes(prefixes) => with_promote_metadata_prefixes(prefixes);
+            promote_resource_metadata_prefixes(prefixes) => with_promote_resource_metadata_prefixes(prefixes);
+        );
     };
 }
 
@@ -727,21 +704,13 @@ fn build_otel_log_config(
             .service_name
             .unwrap_or_else(default_otel_service_name),
     );
-    if let Some(size) = options.max_queue_size {
-        config = config.with_max_queue_size(size as usize);
-    }
-    if let Some(size) = options.max_export_batch_size {
-        config = config.with_max_export_batch_size(size as usize);
-    }
-    if let Some(delay) = options.scheduled_delay_millis {
-        config = config.with_scheduled_delay(Duration::from_millis(delay.into()));
-    }
-    if let Some(ttl) = options.completed_span_context_ttl_millis {
-        config = config.with_completed_span_context_ttl(completed_span_context_ttl(ttl)?);
-    }
-    if let Some(severity) = options.minimum_severity {
-        config = config.with_minimum_severity(severity.into());
-    }
+    option_setters!(config, options;
+        max_queue_size(size) => with_max_queue_size(size as usize);
+        max_export_batch_size(size) => with_max_export_batch_size(size as usize);
+        scheduled_delay_millis(delay) => with_scheduled_delay(Duration::from_millis(delay.into()));
+        completed_span_context_ttl_millis(ttl) => with_completed_span_context_ttl(completed_span_context_ttl(ttl)?);
+        minimum_severity(severity) => with_minimum_severity(severity.into());
+    );
     endpoint_options!(config, options);
     service_options!(config, options);
     Ok(config)
@@ -758,18 +727,12 @@ fn build_otel_metric_config(
             .service_name
             .unwrap_or_else(default_otel_service_name),
     );
-    if let Some(interval) = options.export_interval_millis {
-        config = config.with_export_interval(Duration::from_millis(interval.into()));
-    }
-    if let Some(limit) = options.max_instruments {
-        config = config.with_max_instruments(limit as usize);
-    }
-    if let Some(limit) = options.cardinality_limit {
-        config = config.with_cardinality_limit(limit as usize);
-    }
-    if let Some(temporality) = options.temporality {
-        config = config.with_temporality(temporality.into());
-    }
+    option_setters!(config, options;
+        export_interval_millis(interval) => with_export_interval(Duration::from_millis(interval.into()));
+        max_instruments(limit) => with_max_instruments(limit as usize);
+        cardinality_limit(limit) => with_cardinality_limit(limit as usize);
+        temporality(temporality) => with_temporality(temporality.into());
+    );
     endpoint_options!(config, options);
     service_options!(config, options);
     Ok(config)
@@ -800,55 +763,43 @@ fn build_atof_config(
     match options.r#type.as_deref().unwrap_or("file") {
         "file" => {
             let mut config = nemo_relay_observability::atof::AtofExporterConfig::new();
-            if let Some(output_directory) = options.output_directory {
-                config = config.with_output_directory(PathBuf::from(output_directory));
-            }
-            if let Some(filename) = options.filename {
-                config = config.with_filename(filename);
-            }
-            if let Some(mode) = options.mode {
-                let Some(mode) = nemo_relay_observability::atof::AtofExporterMode::parse(&mode)
-                else {
-                    return Err(Error::invalid_argument(
-                        "mode must be 'append' or 'overwrite'",
-                    ));
-                };
-                config = config.with_mode(mode);
-            }
+            option_setters!(config, options;
+                output_directory(directory) => with_output_directory(PathBuf::from(directory));
+                filename(filename) => with_filename(filename);
+                mode(mode) => with_mode(
+                    nemo_relay_observability::atof::AtofExporterMode::parse(&mode).ok_or_else(|| {
+                        Error::invalid_argument("mode must be 'append' or 'overwrite'")
+                    })?
+                );
+            );
             Ok(config)
         }
         "stream" => {
             let url = options
                 .url
                 .ok_or_else(|| Error::invalid_argument("stream sink requires url"))?;
-            let transport = options.transport.unwrap_or_else(|| "http_post".to_string());
-            let Some(transport) =
-                nemo_relay_observability::atof::AtofEndpointTransport::parse(&transport)
-            else {
-                return Err(Error::invalid_argument(
+            let transport = nemo_relay_observability::atof::AtofEndpointTransport::parse(
+                options.transport.as_deref().unwrap_or("http_post"),
+            )
+            .ok_or_else(|| {
+                Error::invalid_argument(
                     "stream transport must be 'http_post', 'websocket', or 'ndjson'",
-                ));
-            };
+                )
+            })?;
             let mut sink =
                 nemo_relay_observability::atof::AtofStreamSinkConfig::new(url, transport);
-            if let Some(timeout_millis) = options.timeout_millis {
-                sink = sink.with_timeout_millis(timeout_millis.into());
-            }
-            if let Some(allow_insecure) = options.allow_insecure {
-                sink = sink.with_allow_insecure(allow_insecure);
-            }
-            if let Some(field_name_policy) = options.field_name_policy {
-                let Some(field_name_policy) =
-                    nemo_relay_observability::atof::AtofEndpointFieldNamePolicy::parse(
-                        &field_name_policy,
-                    )
-                else {
-                    return Err(Error::invalid_argument(
-                        "stream field_name_policy must be 'preserve' or 'replace_dots'",
-                    ));
-                };
-                sink = sink.with_field_name_policy(field_name_policy);
-            }
+            option_setters!(sink, options;
+                timeout_millis(timeout_millis) => with_timeout_millis(timeout_millis.into());
+                allow_insecure(allow_insecure) => with_allow_insecure(allow_insecure);
+                field_name_policy(policy) => with_field_name_policy(
+                    nemo_relay_observability::atof::AtofEndpointFieldNamePolicy::parse(&policy)
+                        .ok_or_else(|| {
+                            Error::invalid_argument(
+                                "stream field_name_policy must be 'preserve' or 'replace_dots'",
+                            )
+                        })?
+                );
+            );
             sink = with_string_map(sink, options.headers, "headers", |sink, key, value| {
                 sink.with_header(key, value)
             })?;
@@ -887,7 +838,8 @@ fn scoped_json_callback_tsfn(
     env: &Env,
     func: &Function<JsArg, JsArg>,
 ) -> napi::Result<Tsfn<ScopedJsonCall, JsArgs2, JsArg>> {
-    callback_factory::wrap::<JsArgs2, JsArg>(env, Wrapper::Scoped, func)?
+    let func: Function<JsArg, JsArg> = callback_factory::wrap(env, Wrapper::Execution, func)?;
+    callback_factory::wrap::<JsArgs2, JsArg>(env, Wrapper::Scoped, &func)?
         .build_threadsafe_function::<ScopedJsonCall>()
         .weak::<true>()
         .build_callback(|ctx: ThreadsafeCallContext<ScopedJsonCall>| {
@@ -901,77 +853,27 @@ fn serialize_llm_request(request: &LlmRequest) -> FlowResult<Json> {
         .map_err(|error| FlowError::Internal(format!("failed to serialize LlmRequest: {error}")))
 }
 
-async fn scoped_call(
-    func: &Tsfn<ScopedJsonCall, JsArgs2, JsArg>,
-    value: Json,
-    scope: CallbackScope,
+fn scoped_fn<A: Send + 'static, R: Send + 'static>(
+    func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>,
     name: &'static str,
-) -> FlowResult<Json> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let status = func.call_with_return_value(
-        ScopedJsonCall { value, scope },
-        ThreadsafeFunctionCallMode::NonBlocking,
-        move |value: napi::Result<JsArg>, env| {
-            let _ = tx.send(callable::tsfn_envelope(
-                &env,
-                value,
-                &format!("{name} failed"),
-            ));
-            Ok(())
-        },
-    );
-    if status != napi::Status::Ok {
-        return Err(FlowError::Internal(format!(
-            "failed to queue {name}: {status:?}",
-        )));
-    }
-    rx.await
-        .map_err(|error| FlowError::Internal(error.to_string()))?
-}
-
-fn scoped_tool_execution_fn(func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>) -> ToolExecutionNextFn {
+    encode: fn(A) -> FlowResult<Json>,
+    decode: fn(Json) -> FlowResult<R>,
+) -> Arc<dyn Fn(A) -> BoxFuture<FlowResult<R>> + Send + Sync> {
     let func = Arc::new(func);
-    Arc::new(move |args: Json| {
-        let func = func.clone();
+    Arc::new(move |value| {
+        let func = Arc::clone(&func);
         let scope = CallbackScope::capture();
         Box::pin(async move {
-            let result = scoped_call(&func, args, scope, "JS tool execution callback").await?;
-            callable::parse_tool_execution_result(result)
-        })
-    })
-}
-
-fn scoped_llm_execution_fn(func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>) -> LlmExecutionNextFn {
-    let func = Arc::new(func);
-    Arc::new(move |request: LlmRequest| {
-        let func = func.clone();
-        let scope = CallbackScope::capture();
-        Box::pin(async move {
-            let request = serialize_llm_request(&request)?;
-            scoped_call(&func, request, scope, "JS LLM execution callback").await
+            let call = ScopedJsonCall {
+                value: encode(value)?,
+                scope,
+            };
+            decode(callable::call_tsfn(&func, call, name).await?)
         })
     })
 }
 
 type PluginRegistrations = Arc<StdMutex<Vec<PluginRegistration>>>;
-
-fn push_plugin_registration(
-    registrations: &StdMutex<Vec<PluginRegistration>>,
-    name: String,
-    label: &'static str,
-    deregister: fn(&str) -> FlowResult<bool>,
-) {
-    let registered_name = name.clone();
-    lock(registrations).push(PluginRegistration::new(
-        "plugin",
-        name,
-        Box::new(move || {
-            deregister(&registered_name).map(|_| ()).map_err(|error| {
-                PluginError::RegistrationFailed(format!("{label} deregistration failed: {error}"))
-            })
-        }),
-    ));
-}
 
 struct PluginContext<'env> {
     env: &'env Env,
@@ -981,12 +883,32 @@ struct PluginContext<'env> {
 }
 
 impl PluginContext<'_> {
-    fn add(
+    fn register_method(
         &mut self,
         property: &str,
-        callback: impl 'static + Fn(FunctionCallContext) -> Result<()>,
+        label: &'static str,
+        deregister: fn(&str) -> FlowResult<bool>,
+        register: impl 'static + Fn(&FunctionCallContext, &str) -> Result<()>,
     ) -> napi::Result<()> {
-        let function = closure_function(self.env, property, callback)?;
+        let namespace_prefix = self.namespace_prefix.clone();
+        let registrations = Arc::clone(&self.registrations);
+        let function = closure_function(self.env, property, move |ctx| {
+            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
+            register(&ctx, &name)?;
+            let registered_name = name.clone();
+            lock(&registrations).push(PluginRegistration::new(
+                "plugin",
+                name,
+                Box::new(move || {
+                    deregister(&registered_name).map(|_| ()).map_err(|error| {
+                        PluginError::RegistrationFailed(format!(
+                            "{label} deregistration failed: {error}"
+                        ))
+                    })
+                }),
+            ));
+            Ok(())
+        })?;
         self.object.set_named_property(property, function)
     }
 
@@ -998,15 +920,10 @@ impl PluginContext<'_> {
         register: fn(&str, i32, F) -> FlowResult<()>,
         deregister: fn(&str) -> FlowResult<bool>,
     ) -> napi::Result<()> {
-        let namespace_prefix = self.namespace_prefix.clone();
-        let registrations = Arc::clone(&self.registrations);
-        self.add(property, move |ctx| {
-            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
+        self.register_method(property, label, deregister, move |ctx, name| {
             let priority = ctx.get::<i32>(1)?;
             let callback = ctx.get::<Callback>(2)?;
-            register(&name, priority, make(ctx.env, &callback)?).map_err(Error::from)?;
-            push_plugin_registration(&registrations, name, label, deregister);
-            Ok(())
+            register(name, priority, make(ctx.env, &callback)?).map_err(Error::from)
         })
     }
 
@@ -1018,68 +935,52 @@ impl PluginContext<'_> {
         register: fn(&str, i32, bool, F) -> FlowResult<()>,
         deregister: fn(&str) -> FlowResult<bool>,
     ) -> napi::Result<()> {
-        let namespace_prefix = self.namespace_prefix.clone();
-        let registrations = Arc::clone(&self.registrations);
-        self.add(property, move |ctx| {
-            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
+        self.register_method(property, label, deregister, move |ctx, name| {
             let priority = ctx.get::<i32>(1)?;
             let break_chain = ctx.get::<bool>(2)?;
             let callback = ctx.get::<Callback>(3)?;
-            register(&name, priority, break_chain, make(ctx.env, &callback)?)
-                .map_err(Error::from)?;
-            push_plugin_registration(&registrations, name, label, deregister);
-            Ok(())
+            register(name, priority, break_chain, make(ctx.env, &callback)?).map_err(Error::from)
         })
     }
 
     fn subscriber_method(&mut self) -> napi::Result<()> {
-        let namespace_prefix = self.namespace_prefix.clone();
-        let registrations = Arc::clone(&self.registrations);
-        self.add("registerSubscriber", move |ctx| {
-            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
-            let callback = ctx.get::<Callback>(1)?;
-            core_subscriber_api::register_subscriber(
-                &name,
-                callable::wrap_js_event_subscriber(ctx.env, name.clone(), &callback)?,
-            )
-            .map_err(Error::from)?;
-            push_plugin_registration(
-                &registrations,
-                name,
-                "subscriber",
-                core_subscriber_api::deregister_subscriber,
-            );
-            Ok(())
-        })
+        self.register_method(
+            "registerSubscriber",
+            "subscriber",
+            core_subscriber_api::deregister_subscriber,
+            |ctx, name| {
+                let callback = ctx.get::<Callback>(1)?;
+                core_subscriber_api::register_subscriber(
+                    name,
+                    callable::wrap_js_event_subscriber(ctx.env, name.to_owned(), &callback)?,
+                )
+                .map_err(Error::from)
+            },
+        )
     }
 
     fn conditional_gate_method(&mut self) -> napi::Result<()> {
-        let namespace_prefix = self.namespace_prefix.clone();
-        let registrations = Arc::clone(&self.registrations);
-        self.add("registerConditionalMiddlewareGuardrail", move |ctx| {
-            let name = format!("{namespace_prefix}{}", ctx.get::<String>(0)?);
-            let kinds = ctx
-                .get::<Vec<RuntimeRegistrationKind>>(1)?
-                .into_iter()
-                .map(Into::into)
-                .collect::<BTreeSet<_>>();
-            let registration_name = ctx.get::<String>(2)?;
-            let guardrail = ctx.get::<Callback>(3)?;
-            core_registry_api::register_conditional_middleware_guardrail(
-                &name,
-                kinds,
-                &registration_name,
-                node_conditional_middleware_guardrail(ctx.env, &guardrail)?,
-            )
-            .map_err(Error::from)?;
-            push_plugin_registration(
-                &registrations,
-                name,
-                "conditional middleware guardrail",
-                core_registry_api::deregister_conditional_middleware_guardrail,
-            );
-            Ok(())
-        })
+        self.register_method(
+            "registerConditionalMiddlewareGuardrail",
+            "conditional middleware guardrail",
+            core_registry_api::deregister_conditional_middleware_guardrail,
+            |ctx, name| {
+                let kinds = ctx
+                    .get::<Vec<RuntimeRegistrationKind>>(1)?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<BTreeSet<_>>();
+                let registration_name = ctx.get::<String>(2)?;
+                let guardrail = ctx.get::<Callback>(3)?;
+                core_registry_api::register_conditional_middleware_guardrail(
+                    name,
+                    kinds,
+                    &registration_name,
+                    node_conditional_middleware_guardrail(ctx.env, &guardrail)?,
+                )
+                .map_err(Error::from)
+            },
+        )
     }
 }
 
@@ -1096,111 +997,7 @@ fn build_plugin_context<'env>(
     };
     context.conditional_gate_method()?;
     context.subscriber_method()?;
-    context.method(
-        "registerEventMetadataInjector",
-        "event metadata injector",
-        callable::wrap_js_event_metadata_injector_promise_fn,
-        core_registry_api::register_event_metadata_injector,
-        core_registry_api::deregister_event_metadata_injector,
-    )?;
-    context.method(
-        "registerMarkSanitizeGuardrail",
-        "mark sanitize guardrail",
-        callable::wrap_js_event_sanitize_promise_fn,
-        core_registry_api::register_mark_sanitize_guardrail,
-        core_registry_api::deregister_mark_sanitize_guardrail,
-    )?;
-    context.method(
-        "registerScopeSanitizeStartGuardrail",
-        "scope start sanitize guardrail",
-        callable::wrap_js_event_sanitize_promise_fn,
-        core_registry_api::register_scope_sanitize_start_guardrail,
-        core_registry_api::deregister_scope_sanitize_start_guardrail,
-    )?;
-    context.method(
-        "registerScopeSanitizeEndGuardrail",
-        "scope end sanitize guardrail",
-        callable::wrap_js_event_sanitize_promise_fn,
-        core_registry_api::register_scope_sanitize_end_guardrail,
-        core_registry_api::deregister_scope_sanitize_end_guardrail,
-    )?;
-    context.method(
-        "registerToolSanitizeRequestGuardrail",
-        "tool sanitize request guardrail",
-        callable::wrap_js_tool_sanitize_promise_fn,
-        core_registry_api::register_tool_sanitize_request_guardrail,
-        core_registry_api::deregister_tool_sanitize_request_guardrail,
-    )?;
-    context.method(
-        "registerToolSanitizeResponseGuardrail",
-        "tool sanitize response guardrail",
-        callable::wrap_js_tool_sanitize_promise_fn,
-        core_registry_api::register_tool_sanitize_response_guardrail,
-        core_registry_api::deregister_tool_sanitize_response_guardrail,
-    )?;
-    context.method(
-        "registerToolConditionalExecutionGuardrail",
-        "tool conditional execution guardrail",
-        callable::wrap_js_tool_conditional_promise_fn,
-        core_registry_api::register_tool_conditional_execution_guardrail,
-        core_registry_api::deregister_tool_conditional_execution_guardrail,
-    )?;
-    context.method(
-        "registerLlmSanitizeRequestGuardrail",
-        "llm sanitize request guardrail",
-        callable::wrap_js_llm_sanitize_request_promise_fn,
-        core_registry_api::register_llm_sanitize_request_guardrail,
-        core_registry_api::deregister_llm_sanitize_request_guardrail,
-    )?;
-    context.method(
-        "registerLlmSanitizeResponseGuardrail",
-        "llm sanitize response guardrail",
-        callable::wrap_js_llm_sanitize_response_promise_fn,
-        core_registry_api::register_llm_sanitize_response_guardrail,
-        core_registry_api::deregister_llm_sanitize_response_guardrail,
-    )?;
-    context.method(
-        "registerLlmConditionalExecutionGuardrail",
-        "llm conditional execution guardrail",
-        callable::wrap_js_llm_conditional_promise_fn,
-        core_registry_api::register_llm_conditional_execution_guardrail,
-        core_registry_api::deregister_llm_conditional_execution_guardrail,
-    )?;
-    context.chain_method(
-        "registerLlmRequestIntercept",
-        "llm request intercept",
-        callable::wrap_js_llm_request_intercept_promise_fn,
-        core_registry_api::register_llm_request_intercept,
-        core_registry_api::deregister_llm_request_intercept,
-    )?;
-    context.method(
-        "registerLlmExecutionIntercept",
-        "llm execution intercept",
-        callable::wrap_js_llm_exec_intercept_fn,
-        core_registry_api::register_llm_execution_intercept,
-        core_registry_api::deregister_llm_execution_intercept,
-    )?;
-    context.method(
-        "registerLlmStreamExecutionIntercept",
-        "llm stream execution intercept",
-        callable::wrap_js_llm_stream_exec_intercept_fn,
-        core_registry_api::register_llm_stream_execution_intercept,
-        core_registry_api::deregister_llm_stream_execution_intercept,
-    )?;
-    context.chain_method(
-        "registerToolRequestIntercept",
-        "tool request intercept",
-        callable::wrap_js_tool_request_intercept_promise_fn,
-        core_registry_api::register_tool_request_intercept,
-        core_registry_api::deregister_tool_request_intercept,
-    )?;
-    context.method(
-        "registerToolExecutionIntercept",
-        "tool execution intercept",
-        callable::wrap_js_tool_exec_intercept_fn,
-        core_registry_api::register_tool_execution_intercept,
-        core_registry_api::deregister_tool_execution_intercept,
-    )?;
+    install_plugin_methods(&mut context)?;
     Ok(context.object)
 }
 
@@ -1263,21 +1060,24 @@ fn node_llm_codec(
             ));
         }
     };
-    let decode = callable::js_codec_callback(env, decode, "JS codec decode callback failed")?;
-    let encode = callable::js_codec_callback(env, encode, "JS codec encode callback failed")?;
-    Ok(Some(callable::wrap_js_codec(decode, encode)))
+    Ok(Some(Arc::new(callable::NapiCodec {
+        decode: callable::js_codec_callback(env, decode, "JS codec decode callback failed")?,
+        encode: callable::js_codec_callback(env, encode, "JS codec encode callback failed")?,
+    })))
 }
 
 fn node_llm_response_codec(
     env: &Env,
     decode: Option<&Function<JsArg, JsArg>>,
 ) -> Result<Option<Arc<dyn nemo_relay_types::codec::traits::LlmResponseCodec>>> {
-    Ok(decode
-        .map(|decode| {
-            callable::js_codec_callback(env, decode, "JS response codec decode callback failed")
-                .map(callable::wrap_js_response_codec)
-        })
-        .transpose()?)
+    let Some(decode) = decode else {
+        return Ok(None);
+    };
+    let decode_response =
+        callable::js_codec_callback(env, decode, "JS response codec decode callback failed")?;
+    Ok(Some(Arc::new(callable::NapiResponseCodec {
+        decode_response,
+    })))
 }
 
 const PLUGIN_VALIDATE_PREFIX: &str = "JS plugin validate failed";
@@ -1300,26 +1100,25 @@ impl Plugin for NodePlugin {
         let Some(validate) = &self.validate else {
             return vec![];
         };
-        match validate.call(Json::Object(plugin_config.clone())) {
-            Ok(Json::Null) => vec![],
-            Ok(value) => {
-                serde_json::from_value::<Vec<ConfigDiagnostic>>(value).unwrap_or_else(|e| {
-                    vec![ConfigDiagnostic {
-                        level: DiagnosticLevel::Error,
-                        code: "plugin.validate_failed".into(),
-                        component: Some(self.plugin_kind.clone()),
-                        field: None,
-                        message: format!("JS plugin validate returned invalid diagnostics: {e}"),
-                    }]
-                })
-            }
-            Err(error) => vec![ConfigDiagnostic {
+        let failed = |message: String| {
+            vec![ConfigDiagnostic {
                 level: DiagnosticLevel::Error,
                 code: "plugin.validate_failed".into(),
                 component: Some(self.plugin_kind.clone()),
                 field: None,
-                message: error.to_string(),
-            }],
+                message,
+            }]
+        };
+        match validate.call(Json::Object(plugin_config.clone())) {
+            Ok(Json::Null) => vec![],
+            Ok(value) => {
+                serde_json::from_value::<Vec<ConfigDiagnostic>>(value).unwrap_or_else(|error| {
+                    failed(format!(
+                        "JS plugin validate returned invalid diagnostics: {error}"
+                    ))
+                })
+            }
+            Err(error) => failed(error.to_string()),
         }
     }
 
@@ -1337,34 +1136,11 @@ impl Plugin for NodePlugin {
                 namespace_prefix,
                 registrations: registrations.clone(),
             };
-            let (tx, rx) = tokio::sync::oneshot::channel::<FlowResult<()>>();
-            let status = self.register.call_with_return_value(
-                payload,
-                ThreadsafeFunctionCallMode::NonBlocking,
-                move |value: napi::Result<JsArg>, env| {
-                    let _ = tx.send(
-                        callable::tsfn_envelope(&env, value, "JS plugin register callback failed")
-                            .map(|_| ()),
-                    );
-                    Ok(())
-                },
-            );
-            let result = if status != napi::Status::Ok {
-                Err(PluginError::RegistrationFailed(format!(
-                    "failed to queue JS plugin register callback: {status:?}"
-                )))
-            } else {
-                rx.await
-                    .map_err(|_| {
-                        PluginError::RegistrationFailed(
-                            "JS plugin register completion channel closed".into(),
-                        )
-                    })?
-                    .map_err(|error| PluginError::RegistrationFailed(error.to_string()))
-            };
-            if let Err(error) = result {
+            if let Err(error) =
+                callable::call_tsfn(&self.register, payload, "JS plugin register callback").await
+            {
                 rollback_registrations(&mut lock(&registrations));
-                return Err(error);
+                return Err(PluginError::RegistrationFailed(error.to_string()));
             }
 
             let drained = std::mem::take(&mut *lock(&registrations));
@@ -1391,11 +1167,9 @@ impl TryFrom<PropagationContext> for CorePropagationContext {
         let root_uuid = context
             .root_uuid
             .as_deref()
-            .map(uuid::Uuid::parse_str)
-            .transpose()
-            .map_err(|error| Error::invalid_argument(format!("invalid root UUID: {error}")))?;
-        let parent_uuid = uuid::Uuid::parse_str(&context.parent_uuid)
-            .map_err(|error| Error::invalid_argument(format!("invalid parent UUID: {error}")))?;
+            .map(|value| parse_uuid(value, "root UUID"))
+            .transpose()?;
+        let parent_uuid = parse_uuid(&context.parent_uuid, "parent UUID")?;
         let version = u16::try_from(context.version)
             .map_err(|_| Error::invalid_argument("propagation context version is out of range"))?;
         let context = Self {
@@ -1472,28 +1246,38 @@ pub fn create_scope_stack() -> ScopeStack {
     ScopeStack::new()
 }
 
+fn captured<T>(
+    env: &Env,
+    from_callback: impl FnOnce(&CallbackScope, CorePropagationContext) -> Result<T>,
+    from_stack: impl FnOnce() -> FlowResult<T>,
+) -> Result<T> {
+    let scope = effective_scope(env)?;
+    match scope.propagation.clone() {
+        Some(context) => from_callback(&scope, context),
+        None => with_callback_scope(&scope, from_stack).map_err(Error::from),
+    }
+}
+
 /// Capture the current Relay causal parent for application-managed transport.
 #[napi(catch_unwind)]
 pub fn capture_propagation_context(env: Env) -> Result<PropagationContext> {
-    let scope = effective_scope(&env)?;
-    if let Some(context) = scope.propagation.clone() {
-        return callback_propagation_context(&scope, context).map(Into::into);
-    }
-    with_callback_scope(&scope, capture_propagation_context_handle)
-        .map(Into::into)
-        .map_err(Error::from)
+    captured(
+        &env,
+        callback_propagation_context,
+        capture_propagation_context_handle,
+    )
+    .map(Into::into)
 }
 
 /// Capture the current Relay causal parent without a propagation root.
 #[napi(catch_unwind)]
 pub fn capture_rootless_propagation_context(env: Env) -> Result<PropagationContext> {
-    let scope = effective_scope(&env)?;
-    if let Some(context) = scope.propagation.clone() {
-        return rootless_callback_propagation_context(&scope, context).map(Into::into);
-    }
-    with_callback_scope(&scope, capture_rootless_propagation_context_handle)
-        .map(Into::into)
-        .map_err(Error::from)
+    captured(
+        &env,
+        rootless_callback_propagation_context,
+        capture_rootless_propagation_context_handle,
+    )
+    .map(Into::into)
 }
 
 /// Capture the current parent with an optional stable application session root.
@@ -1504,34 +1288,34 @@ pub fn capture_propagation_context_with_root(
 ) -> Result<PropagationContext> {
     let root_uuid = root_uuid
         .as_deref()
-        .map(uuid::Uuid::parse_str)
-        .transpose()
-        .map_err(|error| Error::invalid_argument(format!("invalid root UUID: {error}")))?;
-    let scope = effective_scope(&env)?;
-    if let Some(context) = scope.propagation.clone() {
-        let mut context = rootless_callback_propagation_context(&scope, context)?;
-        context.root_uuid = root_uuid;
-        return Ok(context.into());
-    }
-    with_callback_scope(&scope, || {
-        capture_propagation_context_with_root_handle(root_uuid)
-    })
+        .map(|value| parse_uuid(value, "root UUID"))
+        .transpose()?;
+    captured(
+        &env,
+        |scope, context| {
+            let mut context = rootless_callback_propagation_context(scope, context)?;
+            context.root_uuid = root_uuid;
+            Ok(context)
+        },
+        || capture_propagation_context_with_root_handle(root_uuid),
+    )
     .map(Into::into)
-    .map_err(Error::from)
 }
 
 /// Capture the current Relay context as a W3C `traceparent` value.
 #[napi(catch_unwind)]
 pub fn capture_traceparent(env: Env) -> Result<String> {
-    let scope = effective_scope(&env)?;
-    if let Some(context) = scope.propagation.clone() {
-        let context = callback_propagation_context(&scope, context)?;
-        if let Some(traceparent) = context.traceparent {
-            return Ok(traceparent);
-        }
-        return context.to_traceparent().map_err(Error::from);
-    }
-    with_callback_scope(&scope, capture_traceparent_handle).map_err(Error::from)
+    captured(
+        &env,
+        |scope, context| {
+            let context = callback_propagation_context(scope, context)?;
+            match context.traceparent {
+                Some(traceparent) => Ok(traceparent),
+                None => context.to_traceparent().map_err(Error::from),
+            }
+        },
+        capture_traceparent_handle,
+    )
 }
 /// Serialize a Relay causal context to the JSON wire format.
 #[napi(catch_unwind)]
@@ -2081,12 +1865,40 @@ pub fn tool_call_execute<'env>(
     metadata: Option<Json>,
     tool_call_id: Option<String>,
 ) -> Result<PromiseRaw<'env, ToolExecutionResult>> {
+    let func = scoped_fn(
+        scoped_json_callback_tsfn(env, &func)?,
+        "JS tool execution callback",
+        Ok,
+        callable::parse_tool_execution_result,
+    );
+    execute_tool_call(
+        env,
+        name,
+        args,
+        func,
+        handle,
+        attributes,
+        data,
+        metadata,
+        tool_call_id,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn execute_tool_call<'env>(
+    env: &'env Env,
+    name: String,
+    args: Json,
+    func: ToolExecutionNextFn,
+    handle: Option<&ScopeHandle>,
+    attributes: Option<u32>,
+    data: Option<Json>,
+    metadata: Option<Json>,
+    tool_call_id: Option<String>,
+) -> Result<PromiseRaw<'env, ToolExecutionResult>> {
     let attrs = ToolAttributes::from_bits_truncate(attributes.unwrap_or(0));
     let context = CallContext::capture(env)?;
     let parent = context.parent(handle);
-    let callback: Function<JsArg, JsArg> = callback_factory::wrap(env, Wrapper::Execution, &func)?;
-    let default_fn = scoped_tool_execution_fn(scoped_json_callback_tsfn(env, &callback)?);
-
     spawn_promise(
         env,
         context.run(async move {
@@ -2094,7 +1906,7 @@ pub fn tool_call_execute<'env>(
                 core_tool_api::ToolCallExecuteParams::builder()
                     .name(name)
                     .args(args)
-                    .func(default_fn)
+                    .func(func)
                     .parent(parent)
                     .attributes(attrs)
                     .data_opt(opt_json(data))
@@ -2130,40 +1942,24 @@ pub fn tool_call_execute_async<'env>(
     metadata: Option<Json>,
     tool_call_id: Option<String>,
 ) -> Result<PromiseRaw<'env, ToolExecutionResult>> {
-    let attrs = ToolAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let context = CallContext::capture(env)?;
-    let parent = context.parent(handle);
-
     let pa_fn = Arc::new(PromiseAwareFn::new(env, &func)?);
-
-    let exec_fn: ToolExecutionNextFn = Arc::new(move |args| {
+    let func: ToolExecutionNextFn = Arc::new(move |args| {
         let pa_fn = pa_fn.clone();
         Box::pin(async move {
             let result = pa_fn.call(Invocation::single(args)).await?;
             callable::parse_tool_execution_result(result)
         })
     });
-
-    spawn_promise(
+    execute_tool_call(
         env,
-        context.run(async move {
-            core_tool_api::tool_call_execute(
-                core_tool_api::ToolCallExecuteParams::builder()
-                    .name(name)
-                    .args(args)
-                    .func(exec_fn)
-                    .parent(parent)
-                    .attributes(attrs)
-                    .data_opt(opt_json(data))
-                    .metadata_opt(opt_json(metadata))
-                    .tool_call_id_opt(tool_call_id)
-                    .build(),
-            )
-            .await
-            .map(ToolExecutionResult::from)
-            .map_err(Error::from)
-        }),
-        js_value,
+        name,
+        args,
+        func,
+        handle,
+        attributes,
+        data,
+        metadata,
+        tool_call_id,
     )
 }
 
@@ -2278,12 +2074,47 @@ pub fn llm_call_execute<'env>(
     #[napi(ts_arg_type = "(arg: Json) => any")] codec_encode: Option<Callback>,
     #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<Callback>,
 ) -> Result<PromiseRaw<'env, Json>> {
+    let request: LlmRequest = parse_json(request, "LlmRequest")?;
+    let func = scoped_fn(
+        scoped_json_callback_tsfn(env, &func)?,
+        "JS LLM execution callback",
+        |request| serialize_llm_request(&request),
+        Ok,
+    );
+    execute_llm_call(
+        env,
+        name,
+        request,
+        func,
+        handle,
+        attributes,
+        data,
+        metadata,
+        model_name,
+        codec_decode,
+        codec_encode,
+        response_codec_decode,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn execute_llm_call<'env>(
+    env: &'env Env,
+    name: String,
+    request: LlmRequest,
+    func: LlmExecutionNextFn,
+    handle: Option<&ScopeHandle>,
+    attributes: Option<u32>,
+    data: Option<Json>,
+    metadata: Option<Json>,
+    model_name: Option<String>,
+    codec_decode: Option<Callback>,
+    codec_encode: Option<Callback>,
+    response_codec_decode: Option<Callback>,
+) -> Result<PromiseRaw<'env, Json>> {
     let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
     let context = CallContext::capture(env)?;
     let parent = context.parent(handle);
-    let llm_request: LlmRequest = parse_json(request, "LlmRequest")?;
-    let callback: Function<JsArg, JsArg> = callback_factory::wrap(env, Wrapper::Execution, &func)?;
-    let default_fn = scoped_llm_execution_fn(scoped_json_callback_tsfn(env, &callback)?);
     let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
     let response_codec = node_llm_response_codec(env, response_codec_decode.as_deref())?;
     spawn_promise(
@@ -2291,8 +2122,8 @@ pub fn llm_call_execute<'env>(
         context.run(async move {
             let params = core_llm_api::LlmCallExecuteParams::builder()
                 .name(name)
-                .request(llm_request)
-                .func(default_fn)
+                .request(request)
+                .func(func)
                 .parent(parent)
                 .attributes(attrs)
                 .data_opt(opt_json(data))
@@ -2329,13 +2160,9 @@ pub fn llm_call_execute_async<'env>(
     #[napi(ts_arg_type = "(arg: Json) => any")] codec_encode: Option<Callback>,
     #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<Callback>,
 ) -> Result<PromiseRaw<'env, Json>> {
-    let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
-    let context = CallContext::capture(env)?;
-    let parent = context.parent(handle);
-    let llm_request: LlmRequest = parse_json(request, "LlmRequest")?;
+    let request: LlmRequest = parse_json(request, "LlmRequest")?;
     let pa_fn = Arc::new(PromiseAwareFn::new(env, &func)?);
-
-    let exec_fn: LlmExecutionNextFn = Arc::new(move |request| {
+    let func: LlmExecutionNextFn = Arc::new(move |request| {
         let pa_fn = pa_fn.clone();
         Box::pin(async move {
             pa_fn
@@ -2343,30 +2170,19 @@ pub fn llm_call_execute_async<'env>(
                 .await
         })
     });
-
-    let codec = node_llm_codec(env, codec_decode.as_deref(), codec_encode.as_deref())?;
-    let response_codec = node_llm_response_codec(env, response_codec_decode.as_deref())?;
-
-    spawn_promise(
+    execute_llm_call(
         env,
-        context.run(async move {
-            let params = core_llm_api::LlmCallExecuteParams::builder()
-                .name(name)
-                .request(llm_request)
-                .func(exec_fn)
-                .parent(parent)
-                .attributes(attrs)
-                .data_opt(opt_json(data))
-                .metadata_opt(opt_json(metadata))
-                .model_name_opt(model_name)
-                .codec_opt(codec)
-                .response_codec_opt(response_codec)
-                .build();
-            Box::pin(core_llm_api::llm_call_execute(params))
-                .await
-                .map_err(Error::from)
-        }),
-        js_value,
+        name,
+        request,
+        func,
+        handle,
+        attributes,
+        data,
+        metadata,
+        model_name,
+        codec_decode,
+        codec_encode,
+        response_codec_decode,
     )
 }
 
@@ -2538,20 +2354,24 @@ pub struct RuntimeRegistrationIdentity {
     pub owner: RuntimeRegistrationOwner,
 }
 
-impl From<core_registry_api::RuntimeRegistrationIdentity> for RuntimeRegistrationIdentity {
-    fn from(identity: core_registry_api::RuntimeRegistrationIdentity) -> Self {
-        Self {
-            kind: identity.kind.into(),
-            local_name: identity.local_name,
-            effective_name: identity.effective_name,
-            owner: RuntimeRegistrationOwner {
-                kind: identity.owner.kind.into(),
-                plugin_kind: identity.owner.plugin_kind,
-                component_ordinal: identity.owner.component_ordinal,
-            },
+mirror_fields!(
+    RuntimeRegistrationOwner
+        <= core_registry_api::RuntimeRegistrationOwner {
+            kind,
+            plugin_kind,
+            component_ordinal,
         }
-    }
-}
+);
+
+mirror_fields!(
+    RuntimeRegistrationIdentity
+        <= core_registry_api::RuntimeRegistrationIdentity {
+            kind,
+            local_name,
+            effective_name,
+            owner,
+        }
+);
 
 /// Register a global eligibility gate for runtime registrations matching kind and name.
 #[napi(catch_unwind)]
@@ -2599,36 +2419,47 @@ macro_rules! registration_api {
             $callback:ident: $ts_arg_type:literal
             $(, scope: $scope_uuid:ident)?
             $(, chain: $break_chain:ident)?
+            $(, plugin: $plugin_method:ident($property:literal, $label:literal))?
         ) = $wrap:path => $core_register:path;
         $(#[$deregister_meta:meta])*
         fn $deregister:ident => $core_deregister:path;
-    )*) => {$(
-        $(#[$register_meta])*
-        #[napi(catch_unwind)]
-        pub fn $register(
-            env: Env,
-            $($scope_uuid: String,)?
-            name: String,
-            priority: i32,
-            $($break_chain: bool,)?
-            #[napi(ts_arg_type = $ts_arg_type)] $callback: Callback,
-        ) -> Result<()> {
-            $core_register(
-                $(&parse_scope_uuid(&$scope_uuid)?,)?
-                &name,
-                priority,
-                $($break_chain,)?
-                $wrap(&env, &$callback)?,
-            )
-            .map_err(Error::from)
-        }
+    )*) => {
+        $(
+            $(#[$register_meta])*
+            #[napi(catch_unwind)]
+            pub fn $register(
+                env: Env,
+                $($scope_uuid: String,)?
+                name: String,
+                priority: i32,
+                $($break_chain: bool,)?
+                #[napi(ts_arg_type = $ts_arg_type)] $callback: Callback,
+            ) -> Result<()> {
+                $core_register(
+                    $(&parse_uuid(&$scope_uuid, "UUID")?,)?
+                    &name,
+                    priority,
+                    $($break_chain,)?
+                    $wrap(&env, &$callback)?,
+                )
+                .map_err(Error::from)
+            }
 
-        $(#[$deregister_meta])*
-        #[napi(catch_unwind)]
-        pub fn $deregister($($scope_uuid: String,)? name: String) -> Result<bool> {
-            $core_deregister($(&parse_scope_uuid(&$scope_uuid)?,)? &name).map_err(Error::from)
+            $(#[$deregister_meta])*
+            #[napi(catch_unwind)]
+            pub fn $deregister($($scope_uuid: String,)? name: String) -> Result<bool> {
+                $core_deregister($(&parse_uuid(&$scope_uuid, "UUID")?,)? &name)
+                    .map_err(Error::from)
+            }
+        )*
+
+        fn install_plugin_methods(context: &mut PluginContext<'_>) -> napi::Result<()> {
+            $($(
+                context.$plugin_method($property, $label, $wrap, $core_register, $core_deregister)?;
+            )?)*
+            Ok(())
         }
-    )*};
+    };
 }
 
 registration_api! {
@@ -2637,7 +2468,7 @@ registration_api! {
     #[doc = " The callback receives an immutable event snapshot and may return additions"]
     #[doc = " directly or in a Promise. Relay validates and merges accepted additions"]
     #[doc = " before event sanitizers run."]
-    fn register_event_metadata_injector(injector: "(event: Json) => EventMetadata | Promise<EventMetadata>")
+    fn register_event_metadata_injector(injector: "(event: Json) => EventMetadata | Promise<EventMetadata>", plugin: method("registerEventMetadataInjector", "event metadata injector"))
         = callable::wrap_js_event_metadata_injector_promise_fn => core_registry_api::register_event_metadata_injector;
     #[doc = " Deregister a global event metadata injector by name."]
     fn deregister_event_metadata_injector => core_registry_api::deregister_event_metadata_injector;
@@ -2650,7 +2481,7 @@ registration_api! {
     #[doc = " failures clear the emitted event fields and record the error for"]
     #[doc = " `getLastCallbackError()`. Await `flushSubscribers()` before inspecting"]
     #[doc = " either the delivered event or that error."]
-    fn register_mark_sanitize_guardrail(guardrail: "(event: Json, fields: EventSanitizeFields) => EventSanitizeFields | Promise<EventSanitizeFields>")
+    fn register_mark_sanitize_guardrail(guardrail: "(event: Json, fields: EventSanitizeFields) => EventSanitizeFields | Promise<EventSanitizeFields>", plugin: method("registerMarkSanitizeGuardrail", "mark sanitize guardrail"))
         = callable::wrap_js_event_sanitize_promise_fn => core_registry_api::register_mark_sanitize_guardrail;
     fn deregister_mark_sanitize_guardrail => core_registry_api::deregister_mark_sanitize_guardrail;
 
@@ -2662,7 +2493,7 @@ registration_api! {
     #[doc = " failures clear the emitted event fields and record the error for"]
     #[doc = " `getLastCallbackError()`. Await `flushSubscribers()` before inspecting"]
     #[doc = " either the delivered event or that error."]
-    fn register_scope_sanitize_start_guardrail(guardrail: "(event: Json, fields: EventSanitizeFields) => EventSanitizeFields | Promise<EventSanitizeFields>")
+    fn register_scope_sanitize_start_guardrail(guardrail: "(event: Json, fields: EventSanitizeFields) => EventSanitizeFields | Promise<EventSanitizeFields>", plugin: method("registerScopeSanitizeStartGuardrail", "scope start sanitize guardrail"))
         = callable::wrap_js_event_sanitize_promise_fn => core_registry_api::register_scope_sanitize_start_guardrail;
     fn deregister_scope_sanitize_start_guardrail => core_registry_api::deregister_scope_sanitize_start_guardrail;
 
@@ -2674,7 +2505,7 @@ registration_api! {
     #[doc = " failures clear the emitted event fields and record the error for"]
     #[doc = " `getLastCallbackError()`. Await `flushSubscribers()` before inspecting"]
     #[doc = " either the delivered event or that error."]
-    fn register_scope_sanitize_end_guardrail(guardrail: "(event: Json, fields: EventSanitizeFields) => EventSanitizeFields | Promise<EventSanitizeFields>")
+    fn register_scope_sanitize_end_guardrail(guardrail: "(event: Json, fields: EventSanitizeFields) => EventSanitizeFields | Promise<EventSanitizeFields>", plugin: method("registerScopeSanitizeEndGuardrail", "scope end sanitize guardrail"))
         = callable::wrap_js_event_sanitize_promise_fn => core_registry_api::register_scope_sanitize_end_guardrail;
     fn deregister_scope_sanitize_end_guardrail => core_registry_api::deregister_scope_sanitize_end_guardrail;
 
@@ -2684,7 +2515,7 @@ registration_api! {
     #[doc = " Higher `priority` values run first. Throws if a guardrail with the same `name` already exists."]
     #[doc = " If the callback throws, Relay omits the emitted payload and records the error"]
     #[doc = " for `getLastCallbackError()`."]
-    fn register_tool_sanitize_request_guardrail(guardrail: "(toolName: string, value: Json) => Json | Promise<Json>")
+    fn register_tool_sanitize_request_guardrail(guardrail: "(toolName: string, value: Json) => Json | Promise<Json>", plugin: method("registerToolSanitizeRequestGuardrail", "tool sanitize request guardrail"))
         = callable::wrap_js_tool_sanitize_promise_fn => core_registry_api::register_tool_sanitize_request_guardrail;
     #[doc = " Deregister a tool request sanitization guardrail by name."]
     #[doc = ""]
@@ -2697,7 +2528,7 @@ registration_api! {
     #[doc = " Higher `priority` values run first. Throws if a guardrail with the same `name` already exists."]
     #[doc = " If the callback throws, Relay omits the emitted payload and records the error"]
     #[doc = " for `getLastCallbackError()`."]
-    fn register_tool_sanitize_response_guardrail(guardrail: "(toolName: string, value: Json) => Json | Promise<Json>")
+    fn register_tool_sanitize_response_guardrail(guardrail: "(toolName: string, value: Json) => Json | Promise<Json>", plugin: method("registerToolSanitizeResponseGuardrail", "tool sanitize response guardrail"))
         = callable::wrap_js_tool_sanitize_promise_fn => core_registry_api::register_tool_sanitize_response_guardrail;
     #[doc = " Deregister a tool response sanitization guardrail by name."]
     #[doc = ""]
@@ -2709,7 +2540,7 @@ registration_api! {
     #[doc = " The `guardrail` callback receives `(toolName, args)` and must return `null` to allow"]
     #[doc = " execution or a rejection reason string to block it. Higher `priority` values run first."]
     #[doc = " If the callback throws, the managed call rejects and the protected callback does not run."]
-    fn register_tool_conditional_execution_guardrail(guardrail: "(toolName: string, args: Json) => string | null | Promise<string | null>")
+    fn register_tool_conditional_execution_guardrail(guardrail: "(toolName: string, args: Json) => string | null | Promise<string | null>", plugin: method("registerToolConditionalExecutionGuardrail", "tool conditional execution guardrail"))
         = callable::wrap_js_tool_conditional_promise_fn => core_registry_api::register_tool_conditional_execution_guardrail;
     #[doc = " Deregister a tool conditional execution guardrail by name."]
     #[doc = ""]
@@ -2721,7 +2552,7 @@ registration_api! {
     #[doc = " The `callable` receives `(toolName, args)` and returns transformed args. If `breakChain`"]
     #[doc = " is `true`, no lower-priority intercepts run after this one. Higher `priority` values run first."]
     #[doc = " If the callback throws, the managed call rejects and later middleware does not run."]
-    fn register_tool_request_intercept(callable: "(toolName: string, args: Json) => Json | Promise<Json>", chain: break_chain)
+    fn register_tool_request_intercept(callable: "(toolName: string, args: Json) => Json | Promise<Json>", chain: break_chain, plugin: chain_method("registerToolRequestIntercept", "tool request intercept"))
         = callable::wrap_js_tool_request_intercept_promise_fn => core_registry_api::register_tool_request_intercept;
     #[doc = " Deregister a tool request intercept by name."]
     #[doc = ""]
@@ -2735,7 +2566,7 @@ registration_api! {
     #[doc = " the managed call has no provider-issued correlation identifier. Call"]
     #[doc = " `next(context.args)` to continue the chain, or return an outcome directly"]
     #[doc = " to short-circuit execution."]
-    fn register_tool_execution_intercept(callable: "(context: ToolExecutionContext, next: (args: Json) => ToolExecutionResult | Promise<ToolExecutionResult>) => { result: Json; annotation?: Json; pendingMarks?: Array<PendingMarkSpec> } | Promise<{ result: Json; annotation?: Json; pendingMarks?: Array<PendingMarkSpec> }>")
+    fn register_tool_execution_intercept(callable: "(context: ToolExecutionContext, next: (args: Json) => ToolExecutionResult | Promise<ToolExecutionResult>) => { result: Json; annotation?: Json; pendingMarks?: Array<PendingMarkSpec> } | Promise<{ result: Json; annotation?: Json; pendingMarks?: Array<PendingMarkSpec> }>", plugin: method("registerToolExecutionIntercept", "tool execution intercept"))
         = callable::wrap_js_tool_exec_intercept_fn => core_registry_api::register_tool_execution_intercept;
     #[doc = " Deregister a tool execution intercept by name."]
     #[doc = ""]
@@ -2749,7 +2580,7 @@ registration_api! {
     #[doc = " or `null` to omit the observability payload. Lower `priority` values run first. Throws if a"]
     #[doc = " guardrail with the same `name` already exists. If the callback throws, Relay omits the payload"]
     #[doc = " and annotation, continues publication, and records the error for `getLastCallbackError()`."]
-    fn register_llm_sanitize_request_guardrail(guardrail: "(request: Json, context: LlmSanitizeRequestContext) => Json | null | Promise<Json | null>")
+    fn register_llm_sanitize_request_guardrail(guardrail: "(request: Json, context: LlmSanitizeRequestContext) => Json | null | Promise<Json | null>", plugin: method("registerLlmSanitizeRequestGuardrail", "llm sanitize request guardrail"))
         = callable::wrap_js_llm_sanitize_request_promise_fn => core_registry_api::register_llm_sanitize_request_guardrail;
     #[doc = " Deregister an LLM request sanitization guardrail by name."]
     #[doc = ""]
@@ -2762,7 +2593,7 @@ registration_api! {
     #[doc = " or `null` to omit the observability payload. Lower `priority` values run first. Throws if a"]
     #[doc = " guardrail with the same `name` already exists. If the callback throws, Relay omits the payload"]
     #[doc = " and annotation, continues publication, and records the error for `getLastCallbackError()`."]
-    fn register_llm_sanitize_response_guardrail(guardrail: "(response: Json, context: LlmSanitizeResponseContext) => Json | null | Promise<Json | null>")
+    fn register_llm_sanitize_response_guardrail(guardrail: "(response: Json, context: LlmSanitizeResponseContext) => Json | null | Promise<Json | null>", plugin: method("registerLlmSanitizeResponseGuardrail", "llm sanitize response guardrail"))
         = callable::wrap_js_llm_sanitize_response_promise_fn => core_registry_api::register_llm_sanitize_response_guardrail;
     #[doc = " Deregister an LLM response sanitization guardrail by name."]
     #[doc = ""]
@@ -2774,7 +2605,7 @@ registration_api! {
     #[doc = " The `guardrail` callback receives the LLM request as JSON and must return `null` to allow"]
     #[doc = " execution or a rejection reason string to block it. Higher `priority` values run first."]
     #[doc = " If the callback throws, the managed call rejects and the protected callback does not run."]
-    fn register_llm_conditional_execution_guardrail(guardrail: "(request: Json) => string | null | Promise<string | null>")
+    fn register_llm_conditional_execution_guardrail(guardrail: "(request: Json) => string | null | Promise<string | null>", plugin: method("registerLlmConditionalExecutionGuardrail", "llm conditional execution guardrail"))
         = callable::wrap_js_llm_conditional_promise_fn => core_registry_api::register_llm_conditional_execution_guardrail;
     #[doc = " Deregister an LLM conditional execution guardrail by name."]
     #[doc = ""]
@@ -2787,7 +2618,7 @@ registration_api! {
     #[doc = " If `breakChain` is `true`, no lower-priority intercepts run after this one."]
     #[doc = " Higher `priority` values run first."]
     #[doc = " If the callback throws, the managed call rejects and later middleware does not run."]
-    fn register_llm_request_intercept(callable: "(args: { name: string; request: Json; annotated: Json | null }) => LlmRequestInterceptOutcome | Promise<LlmRequestInterceptOutcome>", chain: break_chain)
+    fn register_llm_request_intercept(callable: "(args: { name: string; request: Json; annotated: Json | null }) => LlmRequestInterceptOutcome | Promise<LlmRequestInterceptOutcome>", chain: break_chain, plugin: chain_method("registerLlmRequestIntercept", "llm request intercept"))
         = callable::wrap_js_llm_request_intercept_promise_fn => core_registry_api::register_llm_request_intercept;
     #[doc = " Deregister an LLM request intercept by name."]
     #[doc = ""]
@@ -2801,7 +2632,7 @@ registration_api! {
     #[doc = " `next` to short-circuit the chain. `next` may be called repeatedly or concurrently while"]
     #[doc = " `callable` is pending; each call receives an isolated scope-stack branch, and"]
     #[doc = " unfinished or later calls reject after `callable` settles."]
-    fn register_llm_execution_intercept(callable: "(request: Json, context: LlmExecutionContext, next: (request: Json) => Json | Promise<Json>) => Json | Promise<Json>")
+    fn register_llm_execution_intercept(callable: "(request: Json, context: LlmExecutionContext, next: (request: Json) => Json | Promise<Json>) => Json | Promise<Json>", plugin: method("registerLlmExecutionIntercept", "llm execution intercept"))
         = callable::wrap_js_llm_exec_intercept_fn => core_registry_api::register_llm_execution_intercept;
     #[doc = " Deregister an LLM execution intercept by name."]
     #[doc = ""]
@@ -2819,75 +2650,13 @@ registration_api! {
     #[doc = " while `callable` is pending; each call receives an isolated scope-stack branch,"]
     #[doc = " and unfinished or later calls reject after the returned interceptor stream settles."]
     #[doc = " A downstream stream returned successfully by `next` keeps its normal lifetime."]
-    fn register_llm_stream_execution_intercept(callable: "(request: Json, context: LlmExecutionContext, next: (request: Json) => Promise<AsyncIterable<Json>>) => AsyncIterable<Json> | Promise<AsyncIterable<Json>>")
+    fn register_llm_stream_execution_intercept(callable: "(request: Json, context: LlmExecutionContext, next: (request: Json) => Promise<AsyncIterable<Json>>) => AsyncIterable<Json> | Promise<AsyncIterable<Json>>", plugin: method("registerLlmStreamExecutionIntercept", "llm stream execution intercept"))
         = callable::wrap_js_llm_stream_exec_intercept_fn => core_registry_api::register_llm_stream_execution_intercept;
     #[doc = " Deregister an LLM stream execution intercept by name."]
     #[doc = ""]
     #[doc = " Returns `true` if an intercept with that name was found and removed."]
     fn deregister_llm_stream_execution_intercept => core_registry_api::deregister_llm_stream_execution_intercept;
-}
 
-/// Register a named event subscriber that receives all lifecycle events.
-///
-/// The `callback` receives each event as the canonical JSON event object and may return a
-/// Promise. Events are delivered asynchronously and non-blocking. Callback failures are
-/// isolated, reported to stderr and `getLastCallbackError()`, and do not reject
-/// `flushSubscribers()`. Throws if a subscriber with the same `name` already exists.
-#[napi(catch_unwind)]
-pub fn register_subscriber(
-    env: Env,
-    name: String,
-    #[napi(ts_arg_type = "(event: Json) => void | Promise<void>")] callback: Callback,
-) -> Result<()> {
-    let callback = callable::wrap_js_event_subscriber(&env, name.clone(), &callback)?;
-    core_subscriber_api::register_subscriber(&name, callback).map_err(Error::from)
-}
-
-/// Deregister an event subscriber by name.
-///
-/// Future emissions stop seeing the subscriber. Already queued event snapshots may
-/// still run. Returns `true` if a subscriber with that name was found and removed.
-#[napi(catch_unwind)]
-pub fn deregister_subscriber(name: String) -> Result<bool> {
-    core_subscriber_api::deregister_subscriber(&name).map_err(Error::from)
-}
-
-/// Return a Promise that resolves when native and JavaScript subscriber callbacks and
-/// managed terminal publications registered before this call finish.
-///
-/// Call this function outside subscribers, event sanitizers, conditional
-/// guardrails, and request or execution intercepts. A queued tool or LLM
-/// observability sanitizer may call it, but the Promise resolves without
-/// waiting for its own publication.
-///
-/// Awaiting this Promise does not block the Node event loop while Promise-returning event
-/// sanitizers settle or queued JavaScript subscriber callbacks run. Native events emitted by a
-/// JavaScript subscriber are separate publications and may require another flush.
-///
-/// The Promise rejects if the blocking task fails or the core subscriber flush returns an error.
-/// Callers should handle errors when awaiting it.
-#[napi(ts_return_type = "Promise<void>", catch_unwind)]
-pub fn flush_subscribers<'env>(env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
-    let reentrant = crate::callback_factory::publication_callback_active(env)?;
-    spawn_promise(
-        env,
-        async move {
-            if reentrant {
-                return Ok(());
-            }
-            tokio::task::spawn_blocking(|| {
-                core_subscriber_api::flush_subscribers()
-                    .map(|()| callable::flush_js_subscriber_callbacks())
-            })
-            .await
-            .map_err(|error| Error::from(FlowError::Internal(error.to_string())))?
-            .map_err(Error::from)
-        },
-        |env, _| js_value(env, ()),
-    )
-}
-
-registration_api! {
     #[doc = " Register an event metadata injector owned by an active scope."]
     fn scope_register_event_metadata_injector(injector: "(event: Json) => EventMetadata | Promise<EventMetadata>", scope: scope_uuid)
         = callable::wrap_js_event_metadata_injector_promise_fn => core_registry_api::scope_register_event_metadata_injector;
@@ -3084,6 +2853,66 @@ registration_api! {
     fn scope_deregister_llm_stream_execution_intercept => core_registry_api::scope_deregister_llm_stream_execution_intercept;
 }
 
+/// Register a named event subscriber that receives all lifecycle events.
+///
+/// The `callback` receives each event as the canonical JSON event object and may return a
+/// Promise. Events are delivered asynchronously and non-blocking. Callback failures are
+/// isolated, reported to stderr and `getLastCallbackError()`, and do not reject
+/// `flushSubscribers()`. Throws if a subscriber with the same `name` already exists.
+#[napi(catch_unwind)]
+pub fn register_subscriber(
+    env: Env,
+    name: String,
+    #[napi(ts_arg_type = "(event: Json) => void | Promise<void>")] callback: Callback,
+) -> Result<()> {
+    let callback = callable::wrap_js_event_subscriber(&env, name.clone(), &callback)?;
+    core_subscriber_api::register_subscriber(&name, callback).map_err(Error::from)
+}
+
+/// Deregister an event subscriber by name.
+///
+/// Future emissions stop seeing the subscriber. Already queued event snapshots may
+/// still run. Returns `true` if a subscriber with that name was found and removed.
+#[napi(catch_unwind)]
+pub fn deregister_subscriber(name: String) -> Result<bool> {
+    core_subscriber_api::deregister_subscriber(&name).map_err(Error::from)
+}
+
+/// Return a Promise that resolves when native and JavaScript subscriber callbacks and
+/// managed terminal publications registered before this call finish.
+///
+/// Call this function outside subscribers, event sanitizers, conditional
+/// guardrails, and request or execution intercepts. A queued tool or LLM
+/// observability sanitizer may call it, but the Promise resolves without
+/// waiting for its own publication.
+///
+/// Awaiting this Promise does not block the Node event loop while Promise-returning event
+/// sanitizers settle or queued JavaScript subscriber callbacks run. Native events emitted by a
+/// JavaScript subscriber are separate publications and may require another flush.
+///
+/// The Promise rejects if the blocking task fails or the core subscriber flush returns an error.
+/// Callers should handle errors when awaiting it.
+#[napi(ts_return_type = "Promise<void>", catch_unwind)]
+pub fn flush_subscribers<'env>(env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+    let reentrant = crate::callback_factory::publication_callback_active(env)?;
+    spawn_promise(
+        env,
+        async move {
+            if reentrant {
+                return Ok(());
+            }
+            tokio::task::spawn_blocking(|| {
+                core_subscriber_api::flush_subscribers()
+                    .map(|()| callable::flush_js_subscriber_callbacks())
+            })
+            .await
+            .map_err(|error| Error::from(FlowError::Internal(error.to_string())))?
+            .map_err(Error::from)
+        },
+        |env, _| js_value(env, ()),
+    )
+}
+
 /// Register a scope-local named event subscriber that receives lifecycle events
 /// for the specified scope.
 ///
@@ -3099,7 +2928,7 @@ pub fn scope_register_subscriber(
     name: String,
     #[napi(ts_arg_type = "(event: Json) => void | Promise<void>")] callback: Callback,
 ) -> Result<()> {
-    let uuid = parse_scope_uuid(&scope_uuid)?;
+    let uuid = parse_uuid(&scope_uuid, "UUID")?;
     let callback = callable::wrap_js_event_subscriber(&env, name.clone(), &callback)?;
     core_subscriber_api::scope_register_subscriber(&uuid, &name, callback).map_err(Error::from)
 }
@@ -3109,7 +2938,7 @@ pub fn scope_register_subscriber(
 /// Returns `true` if a subscriber with that name was found and removed from the specified scope.
 #[napi(catch_unwind)]
 pub fn scope_deregister_subscriber(scope_uuid: String, name: String) -> Result<bool> {
-    let uuid = parse_scope_uuid(&scope_uuid)?;
+    let uuid = parse_uuid(&scope_uuid, "UUID")?;
     core_subscriber_api::scope_deregister_subscriber(&uuid, &name).map_err(Error::from)
 }
 
@@ -3420,15 +3249,9 @@ pub struct OpenTelemetryTlsConfig {
     pub private_key: Option<String>,
 }
 
-impl From<OpenTelemetryTlsConfig> for nemo_relay_observability::OpenTelemetryTlsConfig {
-    fn from(value: OpenTelemetryTlsConfig) -> Self {
-        Self {
-            certificate: value.certificate,
-            client_certificate: value.client_certificate,
-            private_key: value.private_key,
-        }
-    }
-}
+mirror_fields!(OpenTelemetryTlsConfig => nemo_relay_observability::OpenTelemetryTlsConfig {
+    certificate, client_certificate, private_key,
+});
 
 /// Configuration for a subscriber that writes OTLP to a local file.
 ///
@@ -3832,6 +3655,21 @@ impl AdaptiveRuntime {
             .map_err(|_| Error::generic_failure(ADAPTIVE_RUNTIME_SHUT_DOWN))
     }
 
+    fn ready(
+        &self,
+        action: &str,
+    ) -> Result<tokio::sync::MappedMutexGuard<'_, CoreAdaptiveRuntime>> {
+        tokio::sync::MappedMutexGuard::try_map(self.state()?, |state| match state {
+            NodeAdaptiveRuntimeState::Ready(runtime) => Some(runtime),
+            NodeAdaptiveRuntimeState::Pending { .. } => None,
+        })
+        .map_err(|_| {
+            Error::generic_failure(format!(
+                "adaptive runtime must be registered before {action}"
+            ))
+        })
+    }
+
     fn lifecycle<'env>(
         &self,
         env: &'env Env,
@@ -3922,14 +3760,9 @@ impl AdaptiveRuntime {
     /// Bind the runtime's ACG request rewrite to a scope.
     #[napi(js_name = "bindScope", catch_unwind)]
     pub fn bind_scope(&self, scope_handle: &ScopeHandle) -> Result<()> {
-        match &mut *self.state()? {
-            NodeAdaptiveRuntimeState::Pending { .. } => Err(Error::generic_failure(
-                "adaptive runtime must be registered before binding ACG request intercepts",
-            )),
-            NodeAdaptiveRuntimeState::Ready(runtime) => runtime
-                .bind_scope(scope_handle.inner.uuid)
-                .map_err(Error::from),
-        }
+        self.ready("binding ACG request intercepts")?
+            .bind_scope(scope_handle.inner.uuid)
+            .map_err(Error::from)
     }
 
     /// Build cache request facts for an annotated LLM request.
@@ -3937,20 +3770,15 @@ impl AdaptiveRuntime {
     pub fn build_cache_request_facts(&self, options: Json) -> Result<Option<Json>> {
         let options: CacheRequestFactsOptions = serde_json::from_value(options)
             .map_err(|error| Error::invalid_argument(error.to_string()))?;
-        let _request_id = parse_cache_telemetry_request_id(&options.request_id)?;
+        let _request_id = parse_uuid(&options.request_id, "requestId UUID")?;
         let _timestamp = parse_cache_telemetry_timestamp(options.timestamp.as_deref())?;
         let annotated_request: AnnotatedLlmRequest =
             parse_json(options.annotated_request, "annotatedRequest")?;
-        match &*self.state()? {
-            NodeAdaptiveRuntimeState::Pending { .. } => Err(Error::generic_failure(
-                "adaptive runtime must be registered before building cache request facts",
-            )),
-            NodeAdaptiveRuntimeState::Ready(runtime) => Ok(runtime
-                .build_cache_request_facts(&options.agent_id, &options.provider, &annotated_request)
-                .map(|facts| serde_json::to_value(&facts))
-                .transpose()
-                .map_err(Error::from)?),
-        }
+        self.ready("building cache request facts")?
+            .build_cache_request_facts(&options.agent_id, &options.provider, &annotated_request)
+            .map(|facts| serde_json::to_value(&facts))
+            .transpose()
+            .map_err(Error::from)
     }
 }
 
@@ -3979,11 +3807,6 @@ fn parse_cache_telemetry_provider(provider: &str) -> Result<CacheTelemetryProvid
             "unsupported provider: {other}",
         ))),
     }
-}
-
-fn parse_cache_telemetry_request_id(request_id: &str) -> Result<uuid::Uuid> {
-    uuid::Uuid::parse_str(request_id)
-        .map_err(|error| Error::invalid_argument(format!("invalid requestId UUID: {error}")))
 }
 
 fn parse_cache_telemetry_timestamp(timestamp: Option<&str>) -> Result<DateTime<Utc>> {
@@ -4015,7 +3838,7 @@ pub fn build_cache_telemetry_event(options: Json) -> Result<Option<Json>> {
     let options: CacheTelemetryOptions = serde_json::from_value(options)
         .map_err(|error| Error::invalid_argument(error.to_string()))?;
     let provider = parse_cache_telemetry_provider(&options.provider)?;
-    let request_id = parse_cache_telemetry_request_id(&options.request_id)?;
+    let request_id = parse_uuid(&options.request_id, "requestId UUID")?;
     let timestamp = parse_cache_telemetry_timestamp(options.timestamp.as_deref())?;
     let Some(usage_json) = options.usage else {
         return Ok(None);
@@ -4294,7 +4117,12 @@ impl PluginHostActivation {
         close_state.begin_close(false);
         spawn_promise(
             env,
-            async move { close_state.wait_for_close().await },
+            async move {
+                close_state
+                    .wait_for_close()
+                    .await
+                    .map_err(|error| Error::Napi(error.to_napi()))
+            },
             |env, _| js_value(env, ()),
         )
     }
