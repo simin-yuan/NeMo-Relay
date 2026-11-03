@@ -43,6 +43,46 @@ def _schema_types(schema: Any) -> list[type[object]]:
     return []
 
 
+# Chat model classes whose complete replies always carry ``finish_reason`` (OpenAI wire format). ChatNVIDIA does not
+# set ``model_provider``, and when its stream ends early the accumulated metadata is empty.
+_FINISH_REASON_MODELS = frozenset({"ChatOpenAI", "AzureChatOpenAI", "ChatNVIDIA"})
+
+
+def _truncation_reason(message: Any, model: Any) -> str | None:
+    """Return why a reply with tool calls was cut off, or ``None`` if it ended normally.
+
+    LangChain builds streamed tool calls with a partial-JSON parser, so the arguments of a cut-off call still look
+    valid. A reply is cut off when it reports ``finish_reason="length"``, when the Responses API reports
+    ``status="incomplete"``, or when a model that always reports ``finish_reason`` sent neither ``finish_reason`` nor
+    ``status`` (the stream ended before its final event).
+    """
+    if not getattr(message, "tool_calls", None):
+        return None
+    metadata = getattr(message, "response_metadata", None) or {}
+    finish_reason = metadata.get("finish_reason")
+    status = metadata.get("status")
+    if finish_reason == "length":
+        return "finish_reason='length'"
+    if status == "incomplete":
+        details = metadata.get("incomplete_details") or {}
+        reason = details.get("reason") if isinstance(details, dict) else None
+        return f"status='incomplete', reason={reason!r}"
+    expects_finish_reason = metadata.get("model_provider") == "openai" or any(
+        cls.__name__ in _FINISH_REASON_MODELS for cls in type(model).__mro__
+    )
+    if finish_reason is None and status is None and expects_finish_reason:
+        return "stream ended without finish_reason"
+    return None
+
+
+def _reject_truncated_tool_calls(response: Any, model: Any) -> None:
+    """Raise before a cut-off tool call can reach a tool."""
+    for message in getattr(response, "result", None) or []:
+        reason = _truncation_reason(message, model)
+        if reason is not None:
+            raise RuntimeError(f"LLM output truncated ({reason}); its tool calls were not executed")
+
+
 class NemoRelayMiddleware(AgentMiddleware):
     """Route LangChain agent model and tool calls through NeMo Relay.
 
@@ -108,6 +148,7 @@ class NemoRelayMiddleware(AgentMiddleware):
 
         async def _call(req: nemo_relay.LLMRequest) -> Any:
             response = handler(payload_to_model_request(request, req))
+            _reject_truncated_tool_calls(response, request.model)
             return model_response_to_json(response, object_codec)
 
         result = run_sync(
@@ -131,6 +172,7 @@ class NemoRelayMiddleware(AgentMiddleware):
 
         async def _call(req: nemo_relay.LLMRequest) -> Any:
             response = await handler(payload_to_model_request(request, req))
+            _reject_truncated_tool_calls(response, request.model)
             return model_response_to_json(response, object_codec)
 
         result = await self._llm_execute(

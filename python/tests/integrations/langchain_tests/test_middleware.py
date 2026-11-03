@@ -1855,3 +1855,74 @@ def test_structured_response_round_trip_serialization(use_async, kind, model_req
         )
     assert type(result.structured_response) is schema
     assert result.structured_response == answer
+
+
+_CUT_TOOL_CALL = {"name": "write_file", "args": {"path": "report.txt", "content": "line 01\nline"}, "id": "call_1"}
+
+
+def _tool_call_handler(
+    response_metadata: dict[str, Any],
+) -> Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]:
+    from langchain.agents.middleware import ModelResponse
+    from langchain_core.messages import AIMessage
+
+    async def handler(_request: ModelRequest[Any]) -> ModelResponse[Any]:
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[_CUT_TOOL_CALL], response_metadata=response_metadata)]
+        )
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("response_metadata", "reason"),
+    [
+        pytest.param({"model_provider": "openai"}, "stream ended without finish_reason", id="openai_stream_ended"),
+        pytest.param(
+            {"model_provider": "openai", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+            "status='incomplete'",
+            id="responses_incomplete",
+        ),
+        pytest.param({"model_provider": "openai", "finish_reason": "length"}, "finish_reason='length'", id="length"),
+    ],
+)
+def test_awrap_model_call_rejects_cut_off_tool_calls(
+    model_request: ModelRequest[Any],
+    nemo_relay_middleware: NemoRelayMiddleware,
+    response_metadata: dict[str, Any],
+    reason: str,
+) -> None:
+    with pytest.raises(Exception, match="truncated") as exc_info:
+        asyncio.run(nemo_relay_middleware.awrap_model_call(model_request, _tool_call_handler(response_metadata)))
+    assert reason in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "response_metadata",
+    [
+        pytest.param({"model_provider": "openai", "finish_reason": "tool_calls"}, id="chat_complete"),
+        pytest.param({"model_provider": "openai", "status": "completed"}, id="responses_complete"),
+        pytest.param({}, id="mock_model_without_metadata"),
+    ],
+)
+def test_awrap_model_call_passes_complete_tool_calls(
+    model_request: ModelRequest[Any],
+    nemo_relay_middleware: NemoRelayMiddleware,
+    response_metadata: dict[str, Any],
+) -> None:
+    response = asyncio.run(nemo_relay_middleware.awrap_model_call(model_request, _tool_call_handler(response_metadata)))
+    assert response.result[0].tool_calls[0]["name"] == "write_file"
+
+
+def test_truncation_reason_uses_model_class_when_metadata_is_empty() -> None:
+    from langchain_core.messages import AIMessage
+
+    from nemo_relay.integrations.langchain.middleware import _truncation_reason
+
+    class ChatNVIDIA:  # stand-in with the class name of langchain_nvidia_ai_endpoints.ChatNVIDIA
+        pass
+
+    cut = AIMessage(content="", tool_calls=[_CUT_TOOL_CALL], response_metadata={})
+    assert _truncation_reason(cut, ChatNVIDIA()) == "stream ended without finish_reason"
+    assert _truncation_reason(cut, object()) is None
+    assert _truncation_reason(AIMessage(content="text only"), ChatNVIDIA()) is None
