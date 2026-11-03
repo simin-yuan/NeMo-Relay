@@ -3,7 +3,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 
 use chrono::{DateTime, Utc};
@@ -13,6 +13,7 @@ use napi::bindgen_prelude::{
 };
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Env, Status, ValueType};
+use serde::de::DeserializeOwned;
 use serde_json::Value as Json;
 
 use crate::error::{Error, Result};
@@ -199,7 +200,7 @@ pub(crate) fn report_queue_status(status: Status, call: &str) {
     }
 }
 
-static LAST_CALLBACK_ERROR: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static LAST_CALLBACK_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 pub(crate) fn record_callback_error(message: impl Into<String>) {
     let message = message.into();
@@ -217,6 +218,11 @@ pub(crate) fn clear_last_callback_error() {
 
 pub(crate) fn opt_json(val: Option<Json>) -> Option<Json> {
     val.filter(|v| !v.is_null())
+}
+
+pub(crate) fn parse_json<T: DeserializeOwned>(value: Json, what: &str) -> Result<T> {
+    serde_json::from_value(value)
+        .map_err(|error| Error::invalid_argument(format!("invalid {what}: {error}")))
 }
 
 pub(crate) fn checked_json(env: &Env, value: Unknown) -> Result<Json> {

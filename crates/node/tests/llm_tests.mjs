@@ -845,6 +845,47 @@ describe('LLM guardrails', () => {
     }
   });
 
+  it('resolved sanitizer codecs reject BigInt responses with a TypeError', async () => {
+    const codec = new lib.OpenAIChatCodec();
+    let rejection;
+    registerLlmSanitizeResponseGuardrail('node_resolved_llm_response_codec_bigint', 10, (response, context) => {
+      const resolved = context.resolveCodec();
+      assert.notEqual(resolved, null);
+      try {
+        resolved.decodeResponse({ ...response, usage: { prompt_tokens: 1n } });
+      } catch (error) {
+        rejection = error;
+      }
+      return response;
+    });
+
+    try {
+      const response = {
+        id: 'chatcmpl-test',
+        model: 'test-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      };
+      await llmCallExecute(
+        'resolved_sanitizer_codec_bigint_llm',
+        makeNative(),
+        () => response,
+        null,
+        null,
+        null,
+        null,
+        null,
+        codec.decode.bind(codec),
+        ({ annotated, original }) => codec.encode(annotated, original),
+        codec.decodeResponse.bind(codec),
+      );
+      await flushSubscribers();
+      assert.ok(rejection instanceof TypeError, `expected a TypeError, got ${rejection}`);
+      assert.match(rejection.message, /BigInt cannot be represented as JSON/);
+    } finally {
+      deregisterLlmSanitizeResponseGuardrail('node_resolved_llm_response_codec_bigint');
+    }
+  });
+
   it('streaming sanitizers resolve codecs only during callbacks and can omit the final payload', async () => {
     const codec = new lib.OpenAIChatCodec();
     const events = [];

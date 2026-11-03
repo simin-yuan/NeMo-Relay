@@ -94,17 +94,26 @@ impl Factories {
             set_callback_scope: reference(&factories, "setCallbackScope")?,
         })
     }
+}
 
-    fn wrapper(&self, wrapper: Wrapper) -> &FunctionRef<JsArg, JsArg> {
-        match wrapper {
-            Wrapper::Execution => &self.execution,
-            Wrapper::Middleware => &self.middleware,
-            Wrapper::ConditionalGate => &self.conditional_gate,
-            Wrapper::Collector => &self.collector,
-            Wrapper::Finalizer => &self.finalizer,
-            Wrapper::Scoped => &self.scoped,
+impl Wrapper {
+    fn select(self) -> fn(&Factories) -> &FunctionRef<JsArg, JsArg> {
+        match self {
+            Self::Execution => |factories| &factories.execution,
+            Self::Middleware => |factories| &factories.middleware,
+            Self::ConditionalGate => |factories| &factories.conditional_gate,
+            Self::Collector => |factories| &factories.collector,
+            Self::Finalizer => |factories| &factories.finalizer,
+            Self::Scoped => |factories| &factories.scoped,
         }
     }
+}
+
+fn factory<'env, Args: JsValuesTupleIntoVec, Return>(
+    env: &'env Env,
+    select: fn(&Factories) -> &FunctionRef<Args, Return>,
+) -> napi::Result<Function<'env, Args, Return>> {
+    select(&environment::state(env)?.factories).borrow_back(env)
 }
 
 #[derive(Clone)]
@@ -160,11 +169,7 @@ pub(crate) fn wrap<'env, Args: JsValuesTupleIntoVec, Return>(
     wrapper: Wrapper,
     func: &Function<JsArg, JsArg>,
 ) -> napi::Result<Function<'env, Args, Return>> {
-    let wrapped = environment::state(env)?
-        .factories
-        .wrapper(wrapper)
-        .borrow_back(env)?
-        .call(detach(env, func))?;
+    let wrapped = factory(env, wrapper.select())?.call(detach(env, func))?;
     wrapper_function(env, wrapped)
 }
 
@@ -173,10 +178,7 @@ pub(crate) fn wrap_subscriber_callback<'env, Args: JsValuesTupleIntoVec, Return>
     func: &Function<JsArg, JsArg>,
     complete: &Function<'_, JsArg, ()>,
 ) -> napi::Result<Function<'env, Args, Return>> {
-    let wrapper = environment::state(env)?
-        .factories
-        .subscriber
-        .borrow_back(env)?
+    let wrapper = factory(env, |factories| &factories.subscriber)?
         .call(FnArgs::from((detach(env, func), detach(env, complete))))?;
     wrapper_function(env, wrapper)
 }
@@ -186,30 +188,25 @@ pub(crate) fn wrap_promise_callback<'env, Args: JsValuesTupleIntoVec, Return>(
     func: &Function<JsArg, JsArg>,
     settlers: Settlers,
 ) -> napi::Result<Function<'env, Args, Return>> {
-    let wrapper = environment::state(env)?
-        .factories
-        .promise
-        .borrow_back(env)?
-        .call(FnArgs::from((
-            detach(env, func),
-            settlers.resolve,
-            settlers.reject,
-            settlers.stream_push,
-            settlers.stream_end,
-            settlers.next,
-        )))?;
+    let wrapper = factory(env, |factories| &factories.promise)?.call(FnArgs::from((
+        detach(env, func),
+        settlers.resolve,
+        settlers.reject,
+        settlers.stream_push,
+        settlers.stream_end,
+        settlers.next,
+    )))?;
     wrapper_function(env, wrapper)
 }
 
 fn drive_stream<'env>(
     env: &'env Env,
-    helper: &FunctionRef<JsArgs2, JsArg>,
+    helper: fn(&Factories) -> &FunctionRef<JsArgs2, JsArg>,
     poll: &Function<JsArg, JsArg>,
     handle: &Object,
 ) -> napi::Result<Unknown<'env>> {
-    let promise = helper
-        .borrow_back(env)?
-        .call(FnArgs::from((detach(env, poll), detach(env, handle))))?;
+    let promise =
+        factory(env, helper)?.call(FnArgs::from((detach(env, poll), detach(env, handle))))?;
     // SAFETY: `promise` was returned by the helper call above, in `env`.
     Ok(unsafe { promise.into_unknown(env) })
 }
@@ -219,12 +216,7 @@ pub(crate) fn stream_next<'env>(
     poll: &Function<JsArg, JsArg>,
     handle: &Object,
 ) -> napi::Result<Unknown<'env>> {
-    drive_stream(
-        env,
-        &environment::state(env)?.factories.stream_next,
-        poll,
-        handle,
-    )
+    drive_stream(env, |factories| &factories.stream_next, poll, handle)
 }
 
 pub(crate) fn stream_close<'env>(
@@ -232,12 +224,7 @@ pub(crate) fn stream_close<'env>(
     poll: &Function<JsArg, JsArg>,
     handle: &Object,
 ) -> napi::Result<Unknown<'env>> {
-    drive_stream(
-        env,
-        &environment::state(env)?.factories.stream_close,
-        poll,
-        handle,
-    )
+    drive_stream(env, |factories| &factories.stream_close, poll, handle)
 }
 
 pub(crate) fn pin_while<'env>(
@@ -245,10 +232,7 @@ pub(crate) fn pin_while<'env>(
     handle: &Object,
     promise: &impl JsValue<'env>,
 ) -> napi::Result<Unknown<'env>> {
-    let pinned = environment::state(env)?
-        .factories
-        .pin_while
-        .borrow_back(env)?
+    let pinned = factory(env, |factories| &factories.pin_while)?
         .call(FnArgs::from((detach(env, handle), detach(env, promise))))?;
     // SAFETY: `pinned` was returned by the call above, in `env`.
     Ok(unsafe { pinned.into_unknown(env) })
@@ -263,38 +247,25 @@ pub(crate) fn aggregate_error(
     for (index, error) in errors.into_iter().enumerate() {
         members.set(index as u32, error)?;
     }
-    environment::state(env)?
-        .factories
-        .aggregate
-        .borrow_back(env)?
-        .call(FnArgs::from((
-            detach(env, &members),
-            js_value(env, message)?,
-        )))
+    factory(env, |factories| &factories.aggregate)?.call(FnArgs::from((
+        detach(env, &members),
+        js_value(env, message)?,
+    )))
 }
 
 pub(crate) fn publication_callback_active(env: &Env) -> napi::Result<bool> {
-    environment::state(env)?
-        .factories
-        .publication_callback_active
-        .borrow_back(env)?
-        .call(())
+    factory(env, |factories| &factories.publication_callback_active)?.call(())
 }
 
 pub(crate) fn event_sanitizer_callback_context_id(env: &Env) -> napi::Result<Option<String>> {
-    environment::state(env)?
-        .factories
-        .event_sanitizer_callback_context_id
-        .borrow_back(env)?
-        .call(())
+    factory(env, |factories| {
+        &factories.event_sanitizer_callback_context_id
+    })?
+    .call(())
 }
 
 pub(crate) fn callback_scope(env: &Env) -> napi::Result<Option<CallbackScope>> {
-    let scope = environment::state(env)?
-        .factories
-        .callback_scope
-        .borrow_back(env)?
-        .call(())?;
+    let scope = factory(env, |factories| &factories.callback_scope)?.call(())?;
     // SAFETY: `scope` was returned by the call above, in `env`.
     callback_scope_from(env, unsafe { scope.into_unknown(env) })
 }
@@ -304,19 +275,12 @@ pub(crate) fn with_callback_scope<'env>(
     scope: CallbackScope,
     callback: &Function<JsArg, JsArg>,
 ) -> napi::Result<Unknown<'env>> {
-    let value = environment::state(env)?
-        .factories
-        .with_callback_scope
-        .borrow_back(env)?
+    let value = factory(env, |factories| &factories.with_callback_scope)?
         .call(FnArgs::from((scope.into_js(env)?, detach(env, callback))))?;
     // SAFETY: `value` was returned by the call above, in `env`.
     Ok(unsafe { value.into_unknown(env) })
 }
 
 pub(crate) fn set_callback_scope(env: &Env, scope: CallbackScope) -> napi::Result<bool> {
-    environment::state(env)?
-        .factories
-        .set_callback_scope
-        .borrow_back(env)?
-        .call(scope.into_js(env)?)
+    factory(env, |factories| &factories.set_callback_scope)?.call(scope.into_js(env)?)
 }

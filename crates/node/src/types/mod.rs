@@ -9,6 +9,7 @@ use napi::Env;
 use napi::bindgen_prelude::Unknown;
 use napi_derive::napi;
 
+use crate::convert::{checked_json, parse_json};
 use crate::error::{Error, Result};
 use nemo_relay_runtime::api::runtime::subscriber_dispatcher::PublicationBuffer;
 use nemo_relay_runtime::api::runtime::{ScopeStackHandle, create_scope_stack};
@@ -498,232 +499,133 @@ pub(crate) fn event_sanitize_fields_from_json(
     serde_json::from_value(value)
 }
 
-fn decode_request(codec: &dyn LlmCodec, request: Json) -> Result<Json> {
-    let request: CoreLlmRequest = serde_json::from_value(request)
-        .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-    let annotated = codec.decode(&request)?;
-    serde_json::to_value(&annotated).map_err(Error::from)
+pub(crate) fn decode_request(codec: &dyn LlmCodec, request: Json) -> Result<Json> {
+    let request: CoreLlmRequest = parse_json(request, "LlmRequest")?;
+    serde_json::to_value(codec.decode(&request)?).map_err(Error::from)
 }
 
-fn encode_request(codec: &dyn LlmCodec, annotated: Json, original: Json) -> Result<Json> {
-    let annotated: AnnotatedLlmRequest = serde_json::from_value(annotated)
-        .map_err(|e| Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {e}")))?;
-    let original: CoreLlmRequest = serde_json::from_value(original)
-        .map_err(|e| Error::invalid_argument(format!("invalid LlmRequest: {e}")))?;
-    let encoded = codec.encode(&annotated, &original)?;
-    serde_json::to_value(&encoded).map_err(Error::from)
+pub(crate) fn encode_request(
+    codec: &dyn LlmCodec,
+    annotated: Json,
+    original: Json,
+) -> Result<Json> {
+    let annotated: AnnotatedLlmRequest = parse_json(annotated, "AnnotatedLlmRequest")?;
+    let original: CoreLlmRequest = parse_json(original, "LlmRequest")?;
+    serde_json::to_value(codec.encode(&annotated, &original)?).map_err(Error::from)
 }
 
-fn decode_response(codec: &dyn LlmResponseCodec, response: &Json) -> Result<Json> {
-    let annotated = codec.decode_response(response)?;
-    serde_json::to_value(&annotated).map_err(Error::from)
+pub(crate) fn decode_response(codec: &dyn LlmResponseCodec, response: &Json) -> Result<Json> {
+    serde_json::to_value(codec.decode_response(response)?).map_err(Error::from)
 }
 
-/// Built-in codec for the OpenAI Chat Completions API.
-///
-/// Implements both request codec (decode/encode) and response codec
-/// (decodeResponse). Construct with `new OpenAIChatCodec()`.
-#[napi(js_name = "OpenAIChatCodec")]
-pub struct OpenAIChatCodec {
-    codec: nemo_relay_codecs::openai_chat::OpenAIChatCodec,
-    response_codec: Arc<dyn LlmResponseCodec>,
-}
+macro_rules! builtin_codec {
+    ($(#[$meta:meta])* $name:ident($codec:path, $surface:expr);) => {
+        builtin_codec! {
+            $(#[$meta])*
+            $name($codec, $surface);
 
-#[napi]
-impl OpenAIChatCodec {
-    #[napi(constructor, catch_unwind)]
-    pub fn new() -> Self {
-        Self {
-            codec: nemo_relay_codecs::openai_chat::OpenAIChatCodec,
-            response_codec: nemo_relay_runtime::codec::response_codec(ProviderSurface::OpenAIChat),
+            #[doc = " Decode a raw LLM response into structured form."]
+            #[napi(js_name = "decodeResponse", catch_unwind)]
+            pub fn decode_response(&self, response: Json) -> Result<Json> {
+                decode_response(&*self.response_codec, &response)
+            }
         }
-    }
-
-    /// Decode an opaque LLM request into structured form.
-    #[napi(catch_unwind)]
-    pub fn decode(&self, request: Json) -> Result<Json> {
-        decode_request(&self.codec, request)
-    }
-
-    /// Encode structured changes back into an opaque LLM request.
-    #[napi(catch_unwind)]
-    pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        encode_request(&self.codec, annotated, original)
-    }
-
-    /// Decode a raw LLM response into structured form.
-    #[napi(js_name = "decodeResponse", catch_unwind)]
-    pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&*self.response_codec, &response)
-    }
-}
-
-/// Built-in codec for the OpenAI Responses API.
-///
-/// Implements both request codec (decode/encode) and response codec
-/// (decodeResponse). Construct with `new OpenAIResponsesCodec()`.
-#[napi(js_name = "OpenAIResponsesCodec")]
-pub struct OpenAIResponsesCodec {
-    codec: nemo_relay_codecs::openai_responses::OpenAIResponsesCodec,
-    response_codec: Arc<dyn LlmResponseCodec>,
-}
-
-#[napi]
-impl OpenAIResponsesCodec {
-    #[napi(constructor, catch_unwind)]
-    pub fn new() -> Self {
-        Self {
-            codec: nemo_relay_codecs::openai_responses::OpenAIResponsesCodec,
-            response_codec: nemo_relay_runtime::codec::response_codec(
-                ProviderSurface::OpenAIResponses,
-            ),
+    };
+    ($(#[$meta:meta])* $name:ident($codec:path, $surface:expr); $($decode_response:tt)+) => {
+        $(#[$meta])*
+        pub struct $name {
+            codec: $codec,
+            response_codec: Arc<dyn LlmResponseCodec>,
         }
-    }
 
-    /// Decode an opaque LLM request into structured form.
-    #[napi(catch_unwind)]
-    pub fn decode(&self, request: Json) -> Result<Json> {
-        decode_request(&self.codec, request)
-    }
+        #[napi]
+        impl $name {
+            #[napi(constructor, catch_unwind)]
+            pub fn new() -> Self {
+                Self {
+                    codec: $codec,
+                    response_codec: nemo_relay_runtime::codec::response_codec($surface),
+                }
+            }
 
-    /// Encode structured changes back into an opaque LLM request.
-    #[napi(catch_unwind)]
-    pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        encode_request(&self.codec, annotated, original)
-    }
+            /// Decode an opaque LLM request into structured form.
+            #[napi(catch_unwind)]
+            pub fn decode(&self, request: Json) -> Result<Json> {
+                decode_request(&self.codec, request)
+            }
 
-    /// Decode a raw LLM response into structured form.
-    #[napi(js_name = "decodeResponse", catch_unwind)]
-    pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&*self.response_codec, &response)
-    }
-}
+            /// Encode structured changes back into an opaque LLM request.
+            #[napi(catch_unwind)]
+            pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
+                encode_request(&self.codec, annotated, original)
+            }
 
-/// Built-in codec for the Gemini generateContent API.
-///
-/// Implements both request codec (decode/encode) and response codec
-/// (decodeResponse). Construct with `new GeminiGenerateContentCodec()`.
-#[napi(js_name = "GeminiGenerateContentCodec")]
-pub struct GeminiGenerateContentCodec {
-    codec: nemo_relay_codecs::gemini_generate_content::GeminiGenerateContentCodec,
-    response_codec: Arc<dyn LlmResponseCodec>,
-}
-
-#[napi]
-impl GeminiGenerateContentCodec {
-    #[napi(constructor, catch_unwind)]
-    pub fn new() -> Self {
-        Self {
-            codec: nemo_relay_codecs::gemini_generate_content::GeminiGenerateContentCodec,
-            response_codec: nemo_relay_runtime::codec::response_codec(
-                ProviderSurface::GeminiGenerateContent,
-            ),
+            $($decode_response)+
         }
-    }
+    };
+}
 
-    /// Decode an opaque LLM request into structured form.
-    #[napi(catch_unwind)]
-    pub fn decode(&self, request: Json) -> Result<Json> {
-        decode_request(&self.codec, request)
-    }
+builtin_codec! {
+    #[doc = " Built-in codec for the OpenAI Chat Completions API."]
+    #[doc = ""]
+    #[doc = " Implements both request codec (decode/encode) and response codec"]
+    #[doc = " (decodeResponse). Construct with `new OpenAIChatCodec()`."]
+    #[napi(js_name = "OpenAIChatCodec")]
+    OpenAIChatCodec(nemo_relay_codecs::openai_chat::OpenAIChatCodec, ProviderSurface::OpenAIChat);
+}
 
-    /// Encode structured changes back into an opaque LLM request.
-    #[napi(catch_unwind)]
-    pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        encode_request(&self.codec, annotated, original)
-    }
+builtin_codec! {
+    #[doc = " Built-in codec for the OpenAI Responses API."]
+    #[doc = ""]
+    #[doc = " Implements both request codec (decode/encode) and response codec"]
+    #[doc = " (decodeResponse). Construct with `new OpenAIResponsesCodec()`."]
+    #[napi(js_name = "OpenAIResponsesCodec")]
+    OpenAIResponsesCodec(
+        nemo_relay_codecs::openai_responses::OpenAIResponsesCodec,
+        ProviderSurface::OpenAIResponses
+    );
+}
 
-    /// Decode a raw LLM response into structured form.
-    /// Throws a TypeError if the response contains a BigInt value.
+builtin_codec! {
+    #[doc = " Built-in codec for the Gemini generateContent API."]
+    #[doc = ""]
+    #[doc = " Implements both request codec (decode/encode) and response codec"]
+    #[doc = " (decodeResponse). Construct with `new GeminiGenerateContentCodec()`."]
+    #[napi(js_name = "GeminiGenerateContentCodec")]
+    GeminiGenerateContentCodec(
+        nemo_relay_codecs::gemini_generate_content::GeminiGenerateContentCodec,
+        ProviderSurface::GeminiGenerateContent
+    );
+
+    #[doc = " Decode a raw LLM response into structured form."]
+    #[doc = " Throws a TypeError if the response contains a BigInt value."]
     #[napi(js_name = "decodeResponse", catch_unwind)]
     pub fn decode_response(
         &self,
         env: Env,
         #[napi(ts_arg_type = "any")] response: Unknown,
     ) -> Result<Json> {
-        decode_response(
-            &*self.response_codec,
-            &crate::convert::checked_json(&env, response)?,
-        )
+        decode_response(&*self.response_codec, &checked_json(&env, response)?)
     }
 }
 
-/// Built-in codec for the Anthropic Messages API.
-///
-/// Implements both request codec (decode/encode) and response codec
-/// (decodeResponse). Construct with `new AnthropicMessagesCodec()`.
-#[napi]
-pub struct AnthropicMessagesCodec {
-    codec: nemo_relay_codecs::anthropic::AnthropicMessagesCodec,
-    response_codec: Arc<dyn LlmResponseCodec>,
+builtin_codec! {
+    #[doc = " Built-in codec for the Anthropic Messages API."]
+    #[doc = ""]
+    #[doc = " Implements both request codec (decode/encode) and response codec"]
+    #[doc = " (decodeResponse). Construct with `new AnthropicMessagesCodec()`."]
+    #[napi]
+    AnthropicMessagesCodec(
+        nemo_relay_codecs::anthropic::AnthropicMessagesCodec,
+        ProviderSurface::AnthropicMessages
+    );
 }
 
-#[napi]
-impl AnthropicMessagesCodec {
-    #[napi(constructor, catch_unwind)]
-    pub fn new() -> Self {
-        Self {
-            codec: nemo_relay_codecs::anthropic::AnthropicMessagesCodec,
-            response_codec: nemo_relay_runtime::codec::response_codec(
-                ProviderSurface::AnthropicMessages,
-            ),
-        }
-    }
-
-    /// Decode an opaque LLM request into structured form.
-    #[napi(catch_unwind)]
-    pub fn decode(&self, request: Json) -> Result<Json> {
-        decode_request(&self.codec, request)
-    }
-
-    /// Encode structured changes back into an opaque LLM request.
-    #[napi(catch_unwind)]
-    pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        encode_request(&self.codec, annotated, original)
-    }
-
-    /// Decode a raw LLM response into structured form.
-    #[napi(js_name = "decodeResponse", catch_unwind)]
-    pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&*self.response_codec, &response)
-    }
-}
-
-/// Built-in codec for the OCI Generative AI chat API.
-///
-/// Implements both request codec (decode/encode) and response codec
-/// (decodeResponse). Construct with `new OCIGenAIChatCodec()`.
-#[napi(js_name = "OCIGenAIChatCodec")]
-pub struct OCIGenAIChatCodec {
-    codec: nemo_relay_codecs::oci_genai::OCIGenAIChatCodec,
-    response_codec: Arc<dyn LlmResponseCodec>,
-}
-
-#[napi]
-impl OCIGenAIChatCodec {
-    #[napi(constructor, catch_unwind)]
-    pub fn new() -> Self {
-        Self {
-            codec: nemo_relay_codecs::oci_genai::OCIGenAIChatCodec,
-            response_codec: nemo_relay_runtime::codec::response_codec(ProviderSurface::OCIGenAI),
-        }
-    }
-
-    /// Decode an opaque LLM request into structured form.
-    #[napi(catch_unwind)]
-    pub fn decode(&self, request: Json) -> Result<Json> {
-        decode_request(&self.codec, request)
-    }
-
-    /// Encode structured changes back into an opaque LLM request.
-    #[napi(catch_unwind)]
-    pub fn encode(&self, annotated: Json, original: Json) -> Result<Json> {
-        encode_request(&self.codec, annotated, original)
-    }
-
-    /// Decode a raw LLM response into structured form.
-    #[napi(js_name = "decodeResponse", catch_unwind)]
-    pub fn decode_response(&self, response: Json) -> Result<Json> {
-        decode_response(&*self.response_codec, &response)
-    }
+builtin_codec! {
+    #[doc = " Built-in codec for the OCI Generative AI chat API."]
+    #[doc = ""]
+    #[doc = " Implements both request codec (decode/encode) and response codec"]
+    #[doc = " (decodeResponse). Construct with `new OCIGenAIChatCodec()`."]
+    #[napi(js_name = "OCIGenAIChatCodec")]
+    OCIGenAIChatCodec(nemo_relay_codecs::oci_genai::OCIGenAIChatCodec, ProviderSurface::OCIGenAI);
 }

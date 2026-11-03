@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use napi::bindgen_prelude::{
@@ -13,7 +13,6 @@ use napi::bindgen_prelude::{
 };
 use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMode};
 use napi::{Env, ValueType};
-use napi_derive::napi;
 use nemo_relay_runtime::api::runtime::subscriber_dispatcher::in_dispatcher_callback;
 use nemo_relay_runtime::api::runtime::{
     EventMetadataInjectorFn, EventSanitizeFn, EventSubscriberFn, LlmCodecIdentity, LlmCollector,
@@ -51,19 +50,21 @@ use crate::promise_call::{
 };
 use crate::types::{EventSanitizeFields, event_sanitize_fields_from_json};
 
-#[derive(Default)]
 struct JsSubscriberCallbackState {
     next_id: u64,
     pending: BTreeSet<u64>,
 }
 
-fn js_subscriber_callbacks() -> &'static (Mutex<JsSubscriberCallbackState>, Condvar) {
-    static CALLBACKS: OnceLock<(Mutex<JsSubscriberCallbackState>, Condvar)> = OnceLock::new();
-    CALLBACKS.get_or_init(Default::default)
-}
+static JS_SUBSCRIBER_CALLBACKS: (Mutex<JsSubscriberCallbackState>, Condvar) = (
+    Mutex::new(JsSubscriberCallbackState {
+        next_id: 0,
+        pending: BTreeSet::new(),
+    }),
+    Condvar::new(),
+);
 
 fn reserve_js_subscriber_callback() -> u64 {
-    let (state, _) = js_subscriber_callbacks();
+    let (state, _) = &JS_SUBSCRIBER_CALLBACKS;
     let mut state = lock(state);
     state.next_id += 1;
     let id = state.next_id;
@@ -72,14 +73,14 @@ fn reserve_js_subscriber_callback() -> u64 {
 }
 
 fn complete_js_subscriber_callback(id: u64) {
-    let (state, completed) = js_subscriber_callbacks();
+    let (state, completed) = &JS_SUBSCRIBER_CALLBACKS;
     let mut state = lock(state);
     state.pending.remove(&id);
     completed.notify_all();
 }
 
 pub(crate) fn flush_js_subscriber_callbacks() {
-    let (state, completed) = js_subscriber_callbacks();
+    let (state, completed) = &JS_SUBSCRIBER_CALLBACKS;
     let mut state = lock(state);
     let watermark = state.next_id;
     while state.pending.range(..=watermark).next().is_some() {
@@ -89,21 +90,20 @@ pub(crate) fn flush_js_subscriber_callbacks() {
     }
 }
 
-/// Structured codec identity delivered to JavaScript LLM sanitizers.
-#[napi(object)]
-pub(crate) struct JsLlmCodecIdentity {
-    pub kind: String,
-    pub id: Option<String>,
+#[derive(Serialize)]
+struct JsLlmCodecIdentity {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
-pub(crate) struct JsLlmSanitizeRequestContext {
-    pub codec: JsLlmCodecIdentity,
-    resolved: Option<Arc<dyn LlmCodec>>,
+trait CodecObject: 'static {
+    fn object<'env>(self: Arc<Self>, env: &'env Env) -> napi::Result<Object<'env>>;
 }
 
-pub(crate) struct JsLlmSanitizeResponseContext {
-    pub codec: JsLlmCodecIdentity,
-    resolved: Option<Arc<dyn LlmResponseCodec>>,
+struct JsLlmCodecContext<C: ?Sized> {
+    codec: JsLlmCodecIdentity,
+    resolved: Option<Arc<C>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -227,6 +227,16 @@ fn recorded_internal(message: String) -> FlowError {
     error
 }
 
+fn conditional_outcome(value: Json, what: &str) -> Result<Option<String>> {
+    match value {
+        Json::Null => Ok(None),
+        Json::String(reason) => Ok(Some(reason)),
+        other => Err(recorded_internal(format!(
+            "JS {what} conditional callback failed: expected string or null, got {other:?}"
+        ))),
+    }
+}
+
 pub(crate) fn wrap_js_tool_conditional_promise_fn(
     env: &Env,
     func: &Function<JsArg, JsArg>,
@@ -239,13 +249,7 @@ pub(crate) fn wrap_js_tool_conditional_promise_fn(
                 .call(Invocation::spread(vec![Json::String(name), args]))
                 .await
                 .inspect_err(|error| record_callback_error(error.to_string()))?;
-            match value {
-                Json::Null => Ok(None),
-                Json::String(reason) => Ok(Some(reason)),
-                other => Err(recorded_internal(format!(
-                    "JS tool conditional callback failed: expected string or null, got {other:?}"
-                ))),
-            }
+            conditional_outcome(value, "tool")
         })
     }))
 }
@@ -296,11 +300,11 @@ pub(crate) fn wrap_js_llm_sanitize_request_promise_fn(
                         "failed to serialize JS LLM sanitize request: {error}"
                     ))
                 })?;
-                let context = js_llm_sanitize_request_context(&context);
+                let context = request_codec_context(&context);
                 let invocation = Invocation::spread_built(move |env| {
                     let mut args = env.create_array(2)?;
                     args.set(0, js_value(env, request)?)?;
-                    args.set(1, js_llm_sanitize_request_context_to_napi(env, context)?)?;
+                    args.set(1, codec_context_to_napi(env, context)?)?;
                     Ok(detach(env, &args))
                 });
                 let value = func
@@ -331,11 +335,11 @@ pub(crate) fn wrap_js_llm_sanitize_response_promise_fn(
             let func = func.clone();
             let publication = in_dispatcher_callback();
             Box::pin(async move {
-                let context = js_llm_sanitize_response_context(&context);
+                let context = response_codec_context(&context);
                 let invocation = Invocation::spread_built(move |env| {
                     let mut args = env.create_array(2)?;
                     args.set(0, js_value(env, response)?)?;
-                    args.set(1, js_llm_sanitize_response_context_to_napi(env, context)?)?;
+                    args.set(1, codec_context_to_napi(env, context)?)?;
                     Ok(detach(env, &args))
                 });
                 let value = func
@@ -365,13 +369,7 @@ pub(crate) fn wrap_js_llm_conditional_promise_fn(
                 .call(Invocation::single(request))
                 .await
                 .inspect_err(|error| record_callback_error(error.to_string()))?;
-            match value {
-                Json::Null => Ok(None),
-                Json::String(reason) => Ok(Some(reason)),
-                other => Err(recorded_internal(format!(
-                    "JS LLM conditional callback failed: expected string or null, got {other:?}"
-                ))),
-            }
+            conditional_outcome(value, "LLM")
         })
     }))
 }
@@ -547,115 +545,69 @@ pub(crate) fn parse_tool_execution_result(value: Json) -> Result<ToolExecutionRe
     })
 }
 
-fn js_llm_sanitize_request_context(
-    context: &LlmSanitizeRequestContext,
-) -> JsLlmSanitizeRequestContext {
-    JsLlmSanitizeRequestContext {
-        codec: js_codec_identity(context.codec()),
-        resolved: context.resolve_codec(),
-    }
-}
-
 fn js_codec_identity(identity: &LlmCodecIdentity) -> JsLlmCodecIdentity {
-    match identity {
-        LlmCodecIdentity::None => JsLlmCodecIdentity {
-            kind: "none".into(),
-            id: None,
-        },
-        LlmCodecIdentity::BuiltIn(codec) => JsLlmCodecIdentity {
-            kind: "builtin".into(),
-            id: Some(codec.id().into()),
-        },
-        LlmCodecIdentity::Runtime(id) => JsLlmCodecIdentity {
-            kind: "runtime".into(),
-            id: Some(id.clone()),
-        },
-        LlmCodecIdentity::Opaque => JsLlmCodecIdentity {
-            kind: "opaque".into(),
-            id: None,
-        },
-    }
+    let (kind, id) = match identity {
+        LlmCodecIdentity::None => ("none", None),
+        LlmCodecIdentity::BuiltIn(codec) => ("builtin", Some(codec.id().into())),
+        LlmCodecIdentity::Runtime(id) => ("runtime", Some(id.clone())),
+        LlmCodecIdentity::Opaque => ("opaque", None),
+    };
+    JsLlmCodecIdentity { kind, id }
 }
 
-fn js_llm_sanitize_response_context(
-    context: &LlmSanitizeResponseContext,
-) -> JsLlmSanitizeResponseContext {
-    JsLlmSanitizeResponseContext {
+fn request_codec_context(context: &LlmSanitizeRequestContext) -> JsLlmCodecContext<dyn LlmCodec> {
+    JsLlmCodecContext {
         codec: js_codec_identity(context.codec()),
         resolved: context.resolve_codec(),
     }
 }
 
-fn request_codec_object(env: &Env, codec: Arc<dyn LlmCodec>) -> napi::Result<Object<'_>> {
-    let mut object = Object::new(env)?;
-    let decode_codec = codec.clone();
-    let decode = closure_function(env, "decode", move |ctx| {
-        let request = ctx.get::<Json>(0)?;
-        let request = serde_json::from_value(request)
-            .map_err(|error| Error::invalid_argument(format!("invalid LlmRequest: {error}")))?;
-        serde_json::to_value(decode_codec.decode(&request).map_err(Error::from)?)
-            .map_err(Error::from)
-    })?;
-    let encode_codec = codec;
-    let encode = closure_function(env, "encode", move |ctx| {
-        let annotated = ctx.get::<Json>(0)?;
-        let original = ctx.get::<Json>(1)?;
-        let annotated = serde_json::from_value(annotated).map_err(|error| {
-            Error::invalid_argument(format!("invalid AnnotatedLlmRequest: {error}"))
+fn response_codec_context(
+    context: &LlmSanitizeResponseContext,
+) -> JsLlmCodecContext<dyn LlmResponseCodec> {
+    JsLlmCodecContext {
+        codec: js_codec_identity(context.codec()),
+        resolved: context.resolve_codec(),
+    }
+}
+
+impl CodecObject for dyn LlmCodec {
+    fn object<'env>(self: Arc<Self>, env: &'env Env) -> napi::Result<Object<'env>> {
+        let mut object = Object::new(env)?;
+        let decode_codec = Arc::clone(&self);
+        let decode = closure_function(env, "decode", move |ctx| {
+            crate::types::decode_request(&*decode_codec, ctx.get(0)?)
         })?;
-        let original = serde_json::from_value(original)
-            .map_err(|error| Error::invalid_argument(format!("invalid LlmRequest: {error}")))?;
-        serde_json::to_value(
-            encode_codec
-                .encode(&annotated, &original)
-                .map_err(Error::from)?,
-        )
-        .map_err(Error::from)
-    })?;
-    object.set_named_property("decode", decode)?;
-    object.set_named_property("encode", encode)?;
-    Ok(object)
+        let encode = closure_function(env, "encode", move |ctx| {
+            crate::types::encode_request(&*self, ctx.get(0)?, ctx.get(1)?)
+        })?;
+        object.set_named_property("decode", decode)?;
+        object.set_named_property("encode", encode)?;
+        Ok(object)
+    }
 }
 
-fn response_codec_object(env: &Env, codec: Arc<dyn LlmResponseCodec>) -> napi::Result<Object<'_>> {
-    let mut object = Object::new(env)?;
-    let decode = closure_function(env, "decodeResponse", move |ctx| {
-        let response = ctx.get::<Json>(0)?;
-        serde_json::to_value(codec.decode_response(&response).map_err(Error::from)?)
-            .map_err(Error::from)
-    })?;
-    object.set_named_property("decodeResponse", decode)?;
-    Ok(object)
+impl CodecObject for dyn LlmResponseCodec {
+    fn object<'env>(self: Arc<Self>, env: &'env Env) -> napi::Result<Object<'env>> {
+        let mut object = Object::new(env)?;
+        let decode = closure_function(env, "decodeResponse", move |ctx| {
+            let response = crate::convert::checked_json(ctx.env, ctx.get(0)?)?;
+            crate::types::decode_response(&*self, &response)
+        })?;
+        object.set_named_property("decodeResponse", decode)?;
+        Ok(object)
+    }
 }
 
-pub(crate) fn js_llm_sanitize_request_context_to_napi(
+fn codec_context_to_napi<C: CodecObject + ?Sized>(
     env: &Env,
-    context: JsLlmSanitizeRequestContext,
+    context: JsLlmCodecContext<C>,
 ) -> napi::Result<JsArg> {
     let mut object = Object::new(env)?;
-    let codec = js_value(env, context.codec)?;
-    object.set_named_property("codec", codec)?;
-
+    object.set_named_property("codec", env.to_js_value(&context.codec)?)?;
     let resolved = context.resolved;
     let resolve_codec = closure_function(env, "resolveCodec", move |ctx| match resolved.clone() {
-        Some(codec) => Ok(detach(ctx.env, &request_codec_object(ctx.env, codec)?)),
-        None => Ok(js_value(ctx.env, Null)?),
-    })?;
-    object.set_named_property("resolveCodec", resolve_codec)?;
-    Ok(detach(env, &object))
-}
-
-pub(crate) fn js_llm_sanitize_response_context_to_napi(
-    env: &Env,
-    context: JsLlmSanitizeResponseContext,
-) -> napi::Result<JsArg> {
-    let mut object = Object::new(env)?;
-    let codec = js_value(env, context.codec)?;
-    object.set_named_property("codec", codec)?;
-
-    let resolved = context.resolved;
-    let resolve_codec = closure_function(env, "resolveCodec", move |ctx| match resolved.clone() {
-        Some(codec) => Ok(detach(ctx.env, &response_codec_object(ctx.env, codec)?)),
+        Some(codec) => Ok(detach(ctx.env, &codec.object(ctx.env)?)),
         None => Ok(js_value(ctx.env, Null)?),
     })?;
     object.set_named_property("resolveCodec", resolve_codec)?;
@@ -672,16 +624,10 @@ fn js_llm_execution_invocation(request: LlmRequest, context: LlmExecutionContext
         let mut execution = Object::new(env)?;
         execution.set_named_property(
             "requestCodec",
-            js_llm_sanitize_request_context_to_napi(
-                env,
-                js_llm_sanitize_request_context(context.request_codec()),
-            )?,
+            codec_context_to_napi(env, request_codec_context(context.request_codec()))?,
         )?;
         let response = match context.response_codec() {
-            Some(context) => js_llm_sanitize_response_context_to_napi(
-                env,
-                js_llm_sanitize_response_context(context),
-            )?,
+            Some(context) => codec_context_to_napi(env, response_codec_context(context))?,
             None => js_value(env, Null)?,
         };
         execution.set_named_property("responseCodec", response)?;
@@ -715,23 +661,53 @@ impl Drop for DirectStreamCallbacks {
 
 type CompletionSlot = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<Json>>>>>;
 
+pub(crate) trait StreamCall: 'static {
+    type Args: JsValuesTupleIntoVec + 'static;
+    const WRAPPER: Wrapper;
+    const NAME: &'static str;
+    const COMPLETION: &'static str;
+    const ERROR_PREFIX: &'static str;
+
+    fn args(self, env: &Env, complete: JsArg, direct: JsArg) -> napi::Result<Self::Args>;
+}
+
 pub(crate) struct JsCollectorCall {
     chunk: Json,
 }
 
+impl StreamCall for JsCollectorCall {
+    type Args = JsArgs3;
+    const WRAPPER: Wrapper = Wrapper::Collector;
+    const NAME: &'static str = "collector";
+    const COMPLETION: &'static str = "__nemo_relay_collector_complete";
+    const ERROR_PREFIX: &'static str = "JS collector callback failed";
+
+    fn args(self, env: &Env, complete: JsArg, direct: JsArg) -> napi::Result<JsArgs3> {
+        Ok(FnArgs::from((js_value(env, self.chunk)?, complete, direct)))
+    }
+}
+
 pub(crate) struct JsFinalizerCall;
 
-type StreamCallArgs<T, Args> = fn(&Env, T, JsArg, JsArg) -> napi::Result<Args>;
+impl StreamCall for JsFinalizerCall {
+    type Args = JsArgs2;
+    const WRAPPER: Wrapper = Wrapper::Finalizer;
+    const NAME: &'static str = "finalizer";
+    const COMPLETION: &'static str = "__nemo_relay_finalizer_complete";
+    const ERROR_PREFIX: &'static str = "nemo_relay: JS finalizer callback failed";
 
-pub(crate) struct JsStreamCallback<T: 'static, Args: 'static + JsValuesTupleIntoVec> {
-    tsfn: Tsfn<T, Args, JsArg>,
+    fn args(self, _env: &Env, complete: JsArg, direct: JsArg) -> napi::Result<JsArgs2> {
+        Ok(FnArgs::from((complete, direct)))
+    }
+}
+
+pub(crate) struct JsStreamCallback<T: StreamCall> {
+    tsfn: Tsfn<T, T::Args, JsArg>,
     teardown: Arc<AtomicBool>,
-    function: PersistentJsFunction<Args, JsArg>,
+    function: PersistentJsFunction<T::Args, JsArg>,
     complete: Arc<PersistentJsFunction<JsArg, ()>>,
     pending: CompletionSlot,
-    args: StreamCallArgs<T, Args>,
     direct: bool,
-    error_prefix: &'static str,
 }
 
 fn completion_function(
@@ -751,16 +727,11 @@ fn completion_function(
     Ok(Arc::new(PersistentJsFunction::new(env, &callback)?))
 }
 
-impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args> {
-    fn new(
-        env: &Env,
-        wrapper: Function<Args, JsArg>,
-        completion_name: &str,
-        error_prefix: &'static str,
-        args: StreamCallArgs<T, Args>,
-    ) -> napi::Result<Self> {
+impl<T: StreamCall> JsStreamCallback<T> {
+    pub(crate) fn new(env: &Env, func: &Function<JsArg, JsArg>) -> napi::Result<Self> {
+        let wrapper: Function<T::Args, JsArg> = callback_factory::wrap(env, T::WRAPPER, func)?;
         let pending = CompletionSlot::default();
-        let complete = completion_function(env, completion_name, &pending, error_prefix)?;
+        let complete = completion_function(env, T::COMPLETION, &pending, T::ERROR_PREFIX)?;
         let queued_complete = Arc::clone(&complete);
         let queued_pending = Arc::clone(&pending);
         let tsfn = wrapper
@@ -769,13 +740,16 @@ impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args>
             .build_callback(move |ctx: ThreadsafeCallContext<T>| {
                 let built = queued_complete.borrow().and_then(|(_, complete)| {
                     let complete = detach(&ctx.env, &complete);
-                    args(&ctx.env, ctx.value, complete, js_value(&ctx.env, false)?)
+                    ctx.value
+                        .args(&ctx.env, complete, js_value(&ctx.env, false)?)
                 });
                 if let Err(error) = &built
                     && let Some(sender) = lock(&queued_pending).take()
                 {
-                    let _ =
-                        sender.send(Err(FlowError::Internal(format!("{error_prefix}: {error}"))));
+                    let _ = sender.send(Err(FlowError::Internal(format!(
+                        "{}: {error}",
+                        T::ERROR_PREFIX
+                    ))));
                 }
                 built
             })?;
@@ -785,16 +759,15 @@ impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args>
             function: PersistentJsFunction::new(env, &wrapper)?,
             complete,
             pending,
-            args,
             direct: true,
-            error_prefix,
         })
     }
 
-    fn queue(&self, call: T, name: &str) -> Result<()> {
+    fn queue(&self, call: T) -> Result<()> {
         if self.teardown.load(Ordering::Acquire) {
             return Err(FlowError::Internal(format!(
-                "JS {name} callback skipped: Node environment is shutting down"
+                "JS {} callback skipped: Node environment is shutting down",
+                T::NAME
             )));
         }
         let status = self
@@ -803,7 +776,10 @@ impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args>
         if status == napi::Status::Ok {
             return Ok(());
         }
-        let message = format!("nemo_relay: failed to queue JS {name} callback: {status:?}");
+        let message = format!(
+            "nemo_relay: failed to queue JS {} callback: {status:?}",
+            T::NAME
+        );
         record_callback_error(message.clone());
         Err(FlowError::Internal(message))
     }
@@ -828,75 +804,38 @@ impl<T: 'static, Args: 'static + JsValuesTupleIntoVec> JsStreamCallback<T, Args>
     fn call_directly(&self, call: T) -> napi::Result<()> {
         let (env, function) = self.function.borrow()?;
         let (_, complete) = self.complete.borrow()?;
-        let args = (self.args)(env, call, detach(env, &complete), js_value(env, true)?)?;
+        let args = call.args(env, detach(env, &complete), js_value(env, true)?)?;
         let envelope = function.call(args)?;
         // SAFETY: `envelope` was returned by the call above, in `env`.
         let envelope = unsafe { envelope.into_unknown(env) };
         if envelope.get_type()? != ValueType::Undefined
             && let Some(sender) = lock(&self.pending).take()
         {
-            let _ = sender.send(unwrap_envelope(envelope, self.error_prefix));
+            let _ = sender.send(unwrap_envelope(envelope, T::ERROR_PREFIX));
         }
         Ok(())
     }
 
-    fn invoke(
-        &self,
-        call: T,
-        sender: tokio::sync::oneshot::Sender<Result<Json>>,
-        name: &str,
-    ) -> Result<()> {
+    fn invoke(&self, call: T, sender: tokio::sync::oneshot::Sender<Result<Json>>) -> Result<()> {
         *lock(&self.pending) = Some(sender);
         if self.calls_directly() {
             return self.call_directly(call).map_err(|error| {
-                let message = format!("nemo_relay: JS {name} callback failed: {error}");
+                let message = format!("nemo_relay: JS {} callback failed: {error}", T::NAME);
                 record_callback_error(message.clone());
                 FlowError::Internal(message)
             });
         }
-        self.queue(call, name)
+        self.queue(call)
     }
 }
 
-pub(crate) fn js_collector_tsfn(
-    env: &Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<JsStreamCallback<JsCollectorCall, JsArgs3>> {
-    let wrapper = callback_factory::wrap(env, Wrapper::Collector, func)?;
-    JsStreamCallback::new(
-        env,
-        wrapper,
-        "__nemo_relay_collector_complete",
-        "JS collector callback failed",
-        |env, JsCollectorCall { chunk }, complete, direct| {
-            Ok(FnArgs::from((js_value(env, chunk)?, complete, direct)))
-        },
-    )
-}
-
-pub(crate) fn js_finalizer_tsfn(
-    env: &Env,
-    func: &Function<JsArg, JsArg>,
-) -> napi::Result<JsStreamCallback<JsFinalizerCall, JsArgs2>> {
-    let wrapper = callback_factory::wrap(env, Wrapper::Finalizer, func)?;
-    JsStreamCallback::new(
-        env,
-        wrapper,
-        "__nemo_relay_finalizer_complete",
-        "nemo_relay: JS finalizer callback failed",
-        |_env, JsFinalizerCall, complete, direct| Ok(FnArgs::from((complete, direct))),
-    )
-}
-
-pub(crate) fn wrap_js_collector_fn(
-    callback: JsStreamCallback<JsCollectorCall, JsArgs3>,
-) -> LlmCollector {
+pub(crate) fn wrap_js_collector_fn(callback: JsStreamCallback<JsCollectorCall>) -> LlmCollector {
     LlmCollector::Async(Box::new(move |chunk: Json| {
         let (sender, reply) = tokio::sync::oneshot::channel();
-        let queued = callback.invoke(JsCollectorCall { chunk }, sender, "collector");
+        let queued = callback.invoke(JsCollectorCall { chunk }, sender);
         Box::pin(async move {
             queued?;
-            await_callback_result(reply, "JS collector callback failed")
+            await_callback_result(reply, JsCollectorCall::ERROR_PREFIX)
                 .await
                 .map(|_| ())
         })
@@ -906,18 +845,16 @@ pub(crate) fn wrap_js_collector_fn(
 pub(crate) type FinalizerError = Arc<Mutex<Option<Error>>>;
 
 pub(crate) fn wrap_js_finalizer_fn(
-    callback: JsStreamCallback<JsFinalizerCall, JsArgs2>,
+    callback: JsStreamCallback<JsFinalizerCall>,
     error: FinalizerError,
 ) -> LlmFinalizer {
     LlmFinalizer::Async(Box::new(move || {
         let (sender, reply) = tokio::sync::oneshot::channel();
-        let queued = callback.invoke(JsFinalizerCall, sender, "finalizer");
+        let queued = callback.invoke(JsFinalizerCall, sender);
         let teardown = callback.teardown();
         Box::pin(async move {
             let result = match queued {
-                Ok(()) => {
-                    await_callback_result(reply, "nemo_relay: JS finalizer callback failed").await
-                }
+                Ok(()) => await_callback_result(reply, JsFinalizerCall::ERROR_PREFIX).await,
                 Err(failure) => Err(failure),
             };
             result.inspect_err(|failure| {
