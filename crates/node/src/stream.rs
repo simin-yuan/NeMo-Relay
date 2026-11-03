@@ -633,13 +633,7 @@ fn poll_step(env: &Env, shared: &Shared, close: bool) -> Result<JsArg> {
             _ => Ok(js_value(env, ())?),
         };
     };
-    let mut state = match state.try_lock() {
-        Ok(state) => state,
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(TryLockError::WouldBlock) => {
-            return Ok(detach(env, &PromiseRaw::<Json>::resolve(env, Json::Null)?));
-        }
-    };
+    let mut state = lock(&state);
     let slot = WakeSlot::new();
     let waker = Waker::from(Arc::clone(&slot));
     let mut cx = Context::from_waker(&waker);

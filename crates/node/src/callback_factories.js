@@ -372,6 +372,15 @@
   return {
     noop() {},
 
+    errorFirst(fn) {
+      return function __nemo_relay_error_first(error, ...args) {
+        if (error !== null) {
+          return undefined;
+        }
+        return fn(...args);
+      };
+    },
+
     execution(fn) {
       return function __nemo_relay_execution_wrapper(...args) {
         try {
@@ -410,11 +419,7 @@
     },
 
     subscriber(fn, complete) {
-      return function __nemo_relay_subscriber_wrapper(error, event, callbackId) {
-        // A failed argument build already completed the callback from Rust.
-        if (error != null) {
-          return;
-        }
+      return function __nemo_relay_subscriber_wrapper(event, callbackId) {
         Promise.resolve()
           .then(() => fn(event))
           .then(
@@ -502,7 +507,6 @@
       const settle = { resolve, reject, streamPush, streamEnd, next };
       const controllers = new Map();
       return function __nemo_relay_promise_wrapper(
-        error,
         abort,
         callId,
         arg0,
@@ -513,10 +517,6 @@
         scope,
         streamResult,
       ) {
-        // A failed argument build already settled the call from Rust.
-        if (error != null) {
-          return;
-        }
         if (abort) {
           controllers.get(callId)?.abort();
           return;

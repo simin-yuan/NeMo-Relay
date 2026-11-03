@@ -49,20 +49,33 @@ impl Error {
 
     pub(crate) fn to_napi(&self) -> napi::Error {
         match self {
-            Self::Napi(error) => error.try_clone().unwrap_or_else(|failure| failure),
+            Self::Napi(error) => clone_napi(error),
             Self::Flow(FlowError::CallbackException {
                 source: Some(source),
                 ..
             }) => match source.downcast_ref::<napi::Error>() {
-                Some(exception) => exception.try_clone().unwrap_or_else(|failure| failure),
+                Some(exception) => clone_napi(exception),
                 None => chained(self),
             },
             other => chained(other),
         }
     }
 
+    pub(crate) fn into_napi(self) -> napi::Error {
+        match self {
+            Self::Napi(error) => error,
+            other => other.to_napi(),
+        }
+    }
+
     pub(crate) fn throw_into(self, env: &Env) -> napi::Error {
-        throw(env, self.to_napi())
+        throw(env, self.into_napi())
+    }
+}
+
+fn clone_napi(error: &napi::Error) -> napi::Error {
+    match error.try_clone() {
+        Ok(clone) | Err(clone) => clone,
     }
 }
 
@@ -92,7 +105,7 @@ pub(crate) fn throw(env: &Env, error: napi::Error) -> napi::Error {
 
 impl From<Error> for JsError {
     fn from(error: Error) -> Self {
-        Self::from(error.to_napi())
+        Self::from(error.into_napi())
     }
 }
 
@@ -101,6 +114,6 @@ impl ToNapiValue for Error {
         env: napi::sys::napi_env,
         val: Self,
     ) -> napi::Result<napi::sys::napi_value> {
-        unsafe { napi::Error::to_napi_value(env, val.to_napi()) }
+        unsafe { napi::Error::to_napi_value(env, val.into_napi()) }
     }
 }

@@ -22,7 +22,7 @@ function abortedThen(signal, started) {
 }
 
 function invoke(wrapper, callId, { abort = false, streamResult = false, scope = undefined } = {}) {
-  wrapper(null, abort, callId, { value: 1 }, false, undefined, false, undefined, scope, streamResult);
+  wrapper(abort, callId, { value: 1 }, false, undefined, false, undefined, scope, streamResult);
 }
 
 function rejectSettle(name) {

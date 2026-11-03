@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use napi::bindgen_prelude::{
-    External, FnArgs, FromNapiRef, FromNapiValue, Function, FunctionRef, JsObjectValue, JsValue,
-    JsValuesTupleIntoVec, Object, Unknown,
+    Array, External, FnArgs, FromNapiRef, FromNapiValue, Function, FunctionRef, JsObjectValue,
+    JsValue, JsValuesTupleIntoVec, Object, Unknown,
 };
+use napi::threadsafe_function::ThreadsafeCallContext;
 use napi::{Env, ValueType};
 use nemo_relay_runtime::api::runtime::subscriber_dispatcher::{
     PublicationBuffer, capture_nested_publication_buffer,
@@ -13,7 +14,7 @@ use nemo_relay_runtime::api::runtime::{
     PropagationContext, ScopeStackHandle, capture_propagation_context, current_scope_stack,
 };
 
-use crate::convert::{JsArg, JsArgs2, detach, js_value};
+use crate::convert::{HandledTsfn, JsArg, JsArgs2, detach, js_value};
 use crate::environment;
 
 const CALLBACK_FACTORIES_SOURCE: &str = include_str!("callback_factories.js");
@@ -70,6 +71,7 @@ factories! {
     stream_close: JsArgs2 => JsArg = "streamClose",
     pin_while: JsArgs2 => JsArg = "pinWhile",
     aggregate: JsArgs2 => JsArg = "aggregate",
+    error_first: JsArg => JsArg = "errorFirst",
     noop: () => () = "noop",
     publication_callback_active: () => bool = "publicationCallbackActive",
     event_sanitizer_callback_context_id: () => Option<String> = "eventSanitizerCallbackContextId",
@@ -156,6 +158,34 @@ pub(crate) fn wrap<'env, Args: JsValuesTupleIntoVec, Return>(
     Function::from_unknown(call(env, wrapper.select(), detach(env, func))?)
 }
 
+fn callee_handled<'env, Args: JsValuesTupleIntoVec, Return>(
+    env: &'env Env,
+    func: &Function<'_, Args, Return>,
+) -> napi::Result<Function<'env, Args, Return>> {
+    Function::from_unknown(call(
+        env,
+        |factories| &factories.error_first,
+        detach(env, func),
+    )?)
+}
+
+pub(crate) fn handled_tsfn<T, Args, Return>(
+    env: &Env,
+    function: &Function<'_, Args, Return>,
+    callback: impl 'static + FnMut(ThreadsafeCallContext<T>) -> napi::Result<Args>,
+) -> napi::Result<HandledTsfn<T, Args, Return>>
+where
+    T: 'static,
+    Args: 'static + JsValuesTupleIntoVec,
+    Return: 'static + FromNapiValue,
+{
+    callee_handled(env, function)?
+        .build_threadsafe_function::<T>()
+        .callee_handled::<true>()
+        .weak::<true>()
+        .build_callback(callback)
+}
+
 pub(crate) fn wrap_subscriber_callback<'env, Args: JsValuesTupleIntoVec, Return>(
     env: &'env Env,
     func: &Function<JsArg, JsArg>,
@@ -222,10 +252,7 @@ pub(crate) fn aggregate_error(
     errors: Vec<napi::Error>,
     message: String,
 ) -> napi::Result<JsArg> {
-    let mut members = env.create_array(errors.len() as u32)?;
-    for (index, error) in errors.into_iter().enumerate() {
-        members.set(index as u32, error)?;
-    }
+    let members = Array::from_vec(env, errors)?;
     factory(env, |factories| &factories.aggregate)?.call(FnArgs::from((
         detach(env, &members),
         js_value(env, message)?,

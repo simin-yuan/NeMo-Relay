@@ -3,7 +3,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
@@ -40,10 +39,9 @@ use nemo_relay_types::error::{FlowError, Result};
 
 use crate::callback_factory::{self, Wrapper};
 use crate::convert::{
-    BoxFuture, JsArg, JsArgs2, JsArgs3, PersistentJsFunction, Tsfn, abort_tsfn, closure_function,
-    detach, js_value, lock, record_callback_error, report_queue_status,
+    BoxFuture, HandledTsfn, JsArg, JsArgs2, JsArgs3, PersistentJsFunction, abort_tsfn,
+    closure_function, detach, js_value, lock, record_callback_error, report_queue_status,
 };
-use crate::environment::teardown_flag;
 use crate::error::Error;
 use crate::promise_call::{Invocation, JsonNextFn, PromiseAwareFn, StreamCancellation};
 use crate::types::{EventSanitizeFields, event_sanitize_fields_from_json, mirror_fields};
@@ -195,27 +193,126 @@ async fn await_callback_result(
         .map_err(|error| FlowError::Internal(format!("{error_prefix}: {error}")))?
 }
 
-pub(crate) async fn call_tsfn<T: 'static, Args: 'static + JsValuesTupleIntoVec>(
-    tsfn: &Tsfn<T, Args, JsArg>,
-    value: T,
-    name: &'static str,
-) -> Result<Json> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
+pub(crate) trait ReplySender: Send + 'static {
+    fn deliver(self, result: Result<Json>);
+}
+
+impl ReplySender for tokio::sync::oneshot::Sender<Result<Json>> {
+    fn deliver(self, result: Result<Json>) {
+        let _ = self.send(result);
+    }
+}
+
+impl ReplySender for std::sync::mpsc::SyncSender<Result<Json>> {
+    fn deliver(self, result: Result<Json>) {
+        let _ = self.send(result);
+    }
+}
+
+pub(crate) struct Reply<S>(Arc<Mutex<Option<S>>>);
+
+impl<S> Clone for Reply<S> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<S: ReplySender> Reply<S> {
+    fn empty() -> Self {
+        Self(Arc::default())
+    }
+
+    fn new(sender: S) -> Self {
+        Self(Arc::new(Mutex::new(Some(sender))))
+    }
+
+    fn arm(&self, sender: S) {
+        *lock(&self.0) = Some(sender);
+    }
+
+    fn deliver(&self, result: Result<Json>) {
+        if let Some(sender) = lock(&self.0).take() {
+            sender.deliver(result);
+        }
+    }
+}
+
+pub(crate) type AsyncReply = Reply<tokio::sync::oneshot::Sender<Result<Json>>>;
+
+pub(crate) trait JsCall: Send + 'static {
+    type Args: 'static + JsValuesTupleIntoVec;
+
+    fn args(self, env: &Env) -> napi::Result<Self::Args>;
+}
+
+impl JsCall for Json {
+    type Args = JsArg;
+
+    fn args(self, env: &Env) -> napi::Result<JsArg> {
+        js_value(env, self)
+    }
+}
+
+pub(crate) struct Queued<C, S> {
+    call: C,
+    reply: Reply<S>,
+}
+
+pub(crate) type ReplyTsfn<C, S> = HandledTsfn<Queued<C, S>, <C as JsCall>::Args, JsArg>;
+
+pub(crate) type AsyncReplyTsfn<C> = ReplyTsfn<C, tokio::sync::oneshot::Sender<Result<Json>>>;
+
+pub(crate) fn reply_tsfn<C: JsCall, S: ReplySender>(
+    env: &Env,
+    function: &Function<'_, C::Args, JsArg>,
+    error_prefix: &'static str,
+) -> napi::Result<ReplyTsfn<C, S>> {
+    callback_factory::handled_tsfn(
+        env,
+        function,
+        move |ctx: ThreadsafeCallContext<Queued<C, S>>| {
+            let Queued { call, reply } = ctx.value;
+            call.args(&ctx.env).inspect_err(|error| {
+                reply.deliver(Err(FlowError::Internal(format!("{error_prefix}: {error}"))));
+            })
+        },
+    )
+}
+
+fn queue_reply<C: JsCall, S: ReplySender>(
+    tsfn: &ReplyTsfn<C, S>,
+    call: C,
+    sender: S,
+    error_prefix: &'static str,
+) -> Result<()> {
+    let reply = Reply::new(sender);
+    let settle = reply.clone();
     let status = tsfn.call_with_return_value(
-        value,
+        Ok(Queued { call, reply }),
         ThreadsafeFunctionCallMode::NonBlocking,
         move |value: napi::Result<JsArg>, env| {
-            let _ = tx.send(tsfn_envelope(&env, value, &format!("{name} failed")));
+            settle.deliver(tsfn_envelope(&env, value, error_prefix));
             Ok(())
         },
     );
-    if status != napi::Status::Ok {
-        return Err(FlowError::Internal(format!(
-            "failed to queue {name}: {status:?}"
-        )));
+    if status == napi::Status::Ok {
+        return Ok(());
     }
-    rx.await
-        .map_err(|_| FlowError::Internal(format!("{name} completion channel closed")))?
+    Err(FlowError::Internal(format!(
+        "{error_prefix}: failed to queue callback: {status:?}"
+    )))
+}
+
+pub(crate) async fn call_tsfn<C: JsCall>(
+    tsfn: &AsyncReplyTsfn<C>,
+    call: C,
+    error_prefix: &'static str,
+) -> Result<Json> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    queue_reply(tsfn, call, tx, error_prefix)?;
+    rx.await.map_err(|_| {
+        FlowError::Internal(format!("{error_prefix}: callback channel disconnected"))
+    })?
 }
 
 fn recorded_internal(message: String) -> FlowError {
@@ -615,8 +712,6 @@ impl Drop for DirectStreamCallbacks {
     }
 }
 
-type CompletionSlot = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<Json>>>>>;
-
 pub(crate) trait StreamCall: 'static {
     type Args: JsValuesTupleIntoVec + 'static;
     const WRAPPER: Wrapper;
@@ -658,26 +753,21 @@ impl StreamCall for JsFinalizerCall {
 }
 
 pub(crate) struct JsStreamCallback<T: StreamCall> {
-    tsfn: Tsfn<T, T::Args, JsArg>,
-    teardown: Arc<AtomicBool>,
+    tsfn: HandledTsfn<T, T::Args, JsArg>,
     function: PersistentJsFunction<T::Args, JsArg>,
     complete: Arc<PersistentJsFunction<JsArg, ()>>,
-    pending: CompletionSlot,
-    direct: bool,
+    pending: AsyncReply,
 }
 
 fn completion_function(
     env: &Env,
     name: &str,
-    pending: &CompletionSlot,
+    pending: &AsyncReply,
     error_prefix: &'static str,
 ) -> napi::Result<Arc<PersistentJsFunction<JsArg, ()>>> {
-    let pending = Arc::clone(pending);
+    let pending = pending.clone();
     let callback = closure_function(env, name, move |ctx| {
-        let envelope = unwrap_envelope(ctx.get::<Unknown>(0)?, error_prefix);
-        if let Some(sender) = lock(&pending).take() {
-            let _ = sender.send(envelope);
-        }
+        pending.deliver(unwrap_envelope(ctx.get::<Unknown>(0)?, error_prefix));
         Ok(())
     })?;
     Ok(Arc::new(PersistentJsFunction::new(env, &callback)?))
@@ -686,75 +776,61 @@ fn completion_function(
 impl<T: StreamCall> JsStreamCallback<T> {
     pub(crate) fn new(env: &Env, func: &Function<JsArg, JsArg>) -> napi::Result<Self> {
         let wrapper: Function<T::Args, JsArg> = callback_factory::wrap(env, T::WRAPPER, func)?;
-        let pending = CompletionSlot::default();
+        let pending = AsyncReply::empty();
         let complete = completion_function(env, T::COMPLETION, &pending, T::ERROR_PREFIX)?;
         let queued_complete = Arc::clone(&complete);
-        let queued_pending = Arc::clone(&pending);
-        let tsfn = wrapper
-            .build_threadsafe_function::<T>()
-            .weak::<true>()
-            .build_callback(move |ctx: ThreadsafeCallContext<T>| {
-                let built = queued_complete.borrow().and_then(|(_, complete)| {
-                    let complete = detach(&ctx.env, &complete);
-                    ctx.value
-                        .args(&ctx.env, complete, js_value(&ctx.env, false)?)
-                });
-                if let Err(error) = &built
-                    && let Some(sender) = lock(&queued_pending).take()
-                {
-                    let _ = sender.send(Err(FlowError::Internal(format!(
-                        "{}: {error}",
-                        T::ERROR_PREFIX
-                    ))));
-                }
-                built
+        let queued_pending = pending.clone();
+        let tsfn =
+            callback_factory::handled_tsfn(env, &wrapper, move |ctx: ThreadsafeCallContext<T>| {
+                queued_complete
+                    .borrow()
+                    .and_then(|(_, complete)| {
+                        let complete = detach(&ctx.env, &complete);
+                        ctx.value
+                            .args(&ctx.env, complete, js_value(&ctx.env, false)?)
+                    })
+                    .inspect_err(|error| {
+                        queued_pending.deliver(Err(FlowError::Internal(format!(
+                            "{}: {error}",
+                            T::ERROR_PREFIX
+                        ))));
+                    })
             })?;
         Ok(Self {
             tsfn,
-            teardown: teardown_flag(env)?,
             function: PersistentJsFunction::new(env, &wrapper)?,
             complete,
             pending,
-            direct: true,
         })
     }
 
     fn queue(&self, call: T) -> Result<()> {
-        if self.teardown.load(Ordering::Acquire) {
-            return Err(FlowError::Internal(format!(
+        match self
+            .tsfn
+            .call(Ok(call), ThreadsafeFunctionCallMode::NonBlocking)
+        {
+            napi::Status::Ok => Ok(()),
+            napi::Status::Closing => Err(FlowError::Internal(format!(
                 "JS {} callback skipped: Node environment is shutting down",
                 T::NAME
-            )));
+            ))),
+            status => {
+                let message = format!(
+                    "nemo_relay: failed to queue JS {} callback: {status:?}",
+                    T::NAME
+                );
+                record_callback_error(message.clone());
+                Err(FlowError::Internal(message))
+            }
         }
-        let status = self
-            .tsfn
-            .call(call, ThreadsafeFunctionCallMode::NonBlocking);
-        if status == napi::Status::Ok {
-            return Ok(());
-        }
-        let message = format!(
-            "nemo_relay: failed to queue JS {} callback: {status:?}",
-            T::NAME
-        );
-        record_callback_error(message.clone());
-        Err(FlowError::Internal(message))
-    }
-
-    pub(crate) fn without_direct(mut self) -> Self {
-        self.direct = false;
-        self
     }
 
     pub(crate) fn abort_tsfn(&self) -> napi::Result<()> {
         abort_tsfn(&self.tsfn)
     }
 
-    fn teardown(&self) -> Arc<AtomicBool> {
-        self.teardown.clone()
-    }
-
     fn calls_directly(&self) -> bool {
-        self.direct && DirectStreamCallbacks::active() && self.function.on_creating_thread()
+        DirectStreamCallbacks::active() && self.function.on_creating_thread()
     }
 
     fn call_directly(&self, call: T) -> napi::Result<()> {
@@ -764,16 +840,15 @@ impl<T: StreamCall> JsStreamCallback<T> {
         let envelope = function.call(args)?;
         // SAFETY: `envelope` was returned by the call above, in `env`.
         let envelope = unsafe { envelope.into_unknown(env) };
-        if envelope.get_type()? != ValueType::Undefined
-            && let Some(sender) = lock(&self.pending).take()
-        {
-            let _ = sender.send(unwrap_envelope(envelope, T::ERROR_PREFIX));
+        if envelope.get_type()? != ValueType::Undefined {
+            self.pending
+                .deliver(unwrap_envelope(envelope, T::ERROR_PREFIX));
         }
         Ok(())
     }
 
     fn invoke(&self, call: T, sender: tokio::sync::oneshot::Sender<Result<Json>>) -> Result<()> {
-        *lock(&self.pending) = Some(sender);
+        self.pending.arm(sender);
         if self.calls_directly() {
             return self.call_directly(call).map_err(|error| {
                 let message = format!("nemo_relay: JS {} callback failed: {error}", T::NAME);
@@ -807,18 +882,14 @@ pub(crate) fn wrap_js_finalizer_fn(
     LlmFinalizer::Async(Box::new(move || {
         let (sender, reply) = tokio::sync::oneshot::channel();
         let queued = callback.invoke(JsFinalizerCall, sender);
-        let teardown = callback.teardown();
         Box::pin(async move {
             let result = match queued {
-                Ok(()) => await_callback_result(reply, JsFinalizerCall::ERROR_PREFIX).await,
+                Ok(()) => await_callback_result(reply, JsFinalizerCall::ERROR_PREFIX)
+                    .await
+                    .inspect_err(|failure| record_callback_error(failure.to_string())),
                 Err(failure) => Err(failure),
             };
-            result.inspect_err(|failure| {
-                if !teardown.load(Ordering::Acquire) {
-                    record_callback_error(failure.to_string());
-                }
-                *lock(&error) = Some(Error::from(failure.clone()));
-            })
+            result.inspect_err(|failure| *lock(&error) = Some(Error::from(failure.clone())))
         })
     }))
 }
@@ -837,22 +908,20 @@ pub(crate) fn wrap_js_event_subscriber(
     let callback: Function<JsArgs2, ()> =
         callback_factory::wrap_subscriber_callback(env, callback, &complete)?;
     let queue_error_name = name;
-    let func = Arc::new(
-        callback
-            .build_threadsafe_function::<JsSubscriberCallbackCall>()
-            .callee_handled::<true>()
-            .weak::<true>()
-            .build_callback(|ctx: ThreadsafeCallContext<JsSubscriberCallbackCall>| {
-                let JsSubscriberCallbackCall { event, callback_id } = ctx.value;
-                let args = js_value(&ctx.env, event).and_then(|event| {
-                    Ok(FnArgs::from((
-                        event,
-                        js_value(&ctx.env, callback_id as f64)?,
-                    )))
-                });
-                args.inspect_err(|_| complete_js_subscriber_callback(callback_id))
-            })?,
-    );
+    let func = Arc::new(callback_factory::handled_tsfn(
+        env,
+        &callback,
+        |ctx: ThreadsafeCallContext<JsSubscriberCallbackCall>| {
+            let JsSubscriberCallbackCall { event, callback_id } = ctx.value;
+            let args = js_value(&ctx.env, event).and_then(|event| {
+                Ok(FnArgs::from((
+                    event,
+                    js_value(&ctx.env, callback_id as f64)?,
+                )))
+            });
+            args.inspect_err(|_| complete_js_subscriber_callback(callback_id))
+        },
+    )?);
     Ok(Arc::new(move |event: &Event| {
         let event_json = match event.try_to_json_value() {
             Ok(event) => event,
@@ -912,57 +981,40 @@ struct JsCodecEncodeArgument<'a> {
     original: &'a LlmRequest,
 }
 
-pub(crate) struct SyncJsCallback<Args: 'static + JsValuesTupleIntoVec + Send> {
-    direct: PersistentJsFunction<Args, JsArg>,
-    queued: Tsfn<Args, Args, JsArg>,
+pub(crate) struct SyncJsCallback<C: JsCall> {
+    direct: PersistentJsFunction<C::Args, JsArg>,
+    queued: ReplyTsfn<C, std::sync::mpsc::SyncSender<Result<Json>>>,
     error_prefix: &'static str,
     timeout: Option<Duration>,
 }
 
-impl<Args: 'static + JsValuesTupleIntoVec + Send> SyncJsCallback<Args> {
+impl<C: JsCall> SyncJsCallback<C> {
     pub(crate) fn new(
         env: &Env,
-        wrapper: Function<Args, JsArg>,
+        wrapper: Function<C::Args, JsArg>,
         error_prefix: &'static str,
         timeout: Option<Duration>,
     ) -> napi::Result<Self> {
         Ok(Self {
             direct: PersistentJsFunction::new(env, &wrapper)?,
-            queued: wrapper
-                .build_threadsafe_function::<Args>()
-                .weak::<true>()
-                .build()?,
+            queued: reply_tsfn(env, &wrapper, error_prefix)?,
             error_prefix,
             timeout,
         })
     }
 
-    pub(crate) fn call(&self, args: Args) -> Result<Json> {
+    pub(crate) fn call(&self, call: C) -> Result<Json> {
         if self.direct.on_creating_thread() {
             let (env, envelope) = self
                 .direct
                 .borrow()
-                .and_then(|(env, function)| Ok((env, function.call(args)?)))
+                .and_then(|(env, function)| Ok((env, function.call(call.args(env)?)?)))
                 .map_err(|error| FlowError::Internal(format!("{}: {error}", self.error_prefix)))?;
             // SAFETY: `envelope` was returned by the call above, in `env`.
             return unwrap_envelope(unsafe { envelope.into_unknown(env) }, self.error_prefix);
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let error_prefix = self.error_prefix;
-        let status = self.queued.call_with_return_value(
-            args,
-            ThreadsafeFunctionCallMode::NonBlocking,
-            move |value: napi::Result<JsArg>, env| {
-                let _ = tx.send(tsfn_envelope(&env, value, error_prefix));
-                Ok(())
-            },
-        );
-        if status != napi::Status::Ok {
-            return Err(FlowError::Internal(format!(
-                "{}: failed to queue callback: {status:?}",
-                self.error_prefix
-            )));
-        }
+        queue_reply(&self.queued, call, tx, self.error_prefix)?;
         recv_callback_result(&rx, self.timeout, self.error_prefix)
     }
 }

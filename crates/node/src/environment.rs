@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use napi::bindgen_prelude::{PromiseRaw, ToNapiValue, within_runtime_if_available};
 use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMode};
@@ -36,7 +36,6 @@ impl Liveness {
 }
 
 pub(crate) struct EnvState {
-    teardown: Arc<AtomicBool>,
     pub(crate) factories: Factories,
     settler: Arc<Tsfn<Settlement, ()>>,
     pending: Arc<AtomicUsize>,
@@ -70,21 +69,16 @@ pub(crate) fn state(env: &Env) -> napi::Result<Rc<EnvState>> {
                 .position(|(known, _)| *known == key)
                 .map(|index| states.swap_remove(index).1)
         });
-        if let Some(state) = removed {
-            state.teardown.store(true, Ordering::Release);
-            if let Err(error) = abort_tsfn(&state.settler) {
-                record_callback_error(format!(
-                    "nemo_relay: failed to abort the promise settler at environment teardown: {error}"
-                ));
-            }
+        if let Some(state) = removed
+            && let Err(error) = abort_tsfn(&state.settler)
+        {
+            record_callback_error(format!(
+                "nemo_relay: failed to abort the promise settler at environment teardown: {error}"
+            ));
         }
     })?;
     STATES.with(|slot| slot.borrow_mut().push((key, Rc::clone(&state))));
     Ok(state)
-}
-
-pub(crate) fn teardown_flag(env: &Env) -> napi::Result<Arc<AtomicBool>> {
-    Ok(Arc::clone(&state(env)?.teardown))
 }
 
 impl EnvState {
@@ -95,9 +89,11 @@ impl EnvState {
             .borrow_back(env)?
             .build_threadsafe_function::<Settlement>()
             .weak::<true>()
-            .build_callback(|ctx: ThreadsafeCallContext<Settlement>| ctx.value.deliver(&ctx.env))?;
+            .build_callback(|ctx: ThreadsafeCallContext<Settlement>| {
+                ctx.value.deliver(&ctx.env);
+                Ok(())
+            })?;
         Ok(Self {
-            teardown: Arc::new(AtomicBool::new(false)),
             factories,
             settler: Arc::new(settler),
             pending: Arc::new(AtomicUsize::new(0)),
@@ -141,7 +137,7 @@ struct Settlement {
 }
 
 impl Settlement {
-    fn deliver(self, env: &Env) -> napi::Result<()> {
+    fn deliver(self, env: &Env) {
         let Self {
             deferred,
             outcome,
@@ -149,14 +145,17 @@ impl Settlement {
             pending,
             liveness,
         } = self;
-        let settled = settle_deferred(env, deferred, outcome);
-        let released = if liveness.keeps_loop_alive() && pending.fetch_sub(1, Ordering::AcqRel) == 1
+        if let Err(error) = settle_deferred(env, deferred, outcome) {
+            record_callback_error(format!("nemo_relay: failed to settle a promise: {error}"));
+        }
+        if liveness.keeps_loop_alive()
+            && pending.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Err(error) = settler_liveness(env, &settler, false)
         {
-            settler_liveness(env, &settler, false)
-        } else {
-            Ok(())
-        };
-        settled.and(released)
+            record_callback_error(format!(
+                "nemo_relay: failed to release the promise settler: {error}"
+            ));
+        }
     }
 }
 

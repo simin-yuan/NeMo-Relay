@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::ThreadsafeCallContext;
 use napi_derive::napi;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value as Json;
@@ -78,7 +77,7 @@ use nemo_relay_types::error::{FlowError, Result as FlowResult};
 use crate::callable;
 use crate::callback_factory::{self, CallbackScope, Wrapper};
 use crate::convert::{
-    BoxFuture, Callback, JAVASCRIPT_MAX_SAFE_INTEGER, JsArg, JsArgs2, Tsfn,
+    BoxFuture, Callback, JAVASCRIPT_MAX_SAFE_INTEGER, JsArg, JsArgs2,
     clear_last_callback_error as clear_recorded_callback_error, closure_function, detach,
     get_last_callback_error as get_recorded_callback_error, js_value, lock, opt_json, parse_json,
     parse_timestamp_micros, record_callback_error,
@@ -139,7 +138,8 @@ pub fn log(
 }
 
 macro_rules! log_levels {
-    ($($level:ident),*) => {$(
+    ($($level:ident: $doc:literal,)*) => {$(
+        #[doc = $doc]
         #[napi(catch_unwind)]
         pub fn $level(message: String, target: Option<String>, fields: Option<Json>) -> Result<()> {
             log(stringify!($level).into(), message, target, fields)
@@ -147,7 +147,13 @@ macro_rules! log_levels {
     )*};
 }
 
-log_levels!(trace, debug, info, warn, error);
+log_levels! {
+    trace: " Emit a trace-level operational log record through Relay's configured sinks.",
+    debug: " Emit a debug-level operational log record through Relay's configured sinks.",
+    info: " Emit an info-level operational log record through Relay's configured sinks.",
+    warn: " Emit a warn-level operational log record through Relay's configured sinks.",
+    error: " Emit an error-level operational log record through Relay's configured sinks.",
+}
 
 /// Acquire a fresh resource metrics snapshot without requiring polling.
 /// Collection runs outside the JavaScript event loop.
@@ -479,7 +485,6 @@ fn init() {
         .expect("node built-in plugin registration should succeed");
 }
 
-#[cfg(not(test))]
 #[napi(module_exports)]
 fn initialize_node_environment(env: Env) -> napi::Result<()> {
     register_node_environment().map_err(|error| napi::Error::from_reason(error.to_string()))?;
@@ -834,18 +839,25 @@ struct ScopedJsonCall {
     scope: CallbackScope,
 }
 
+impl callable::JsCall for ScopedJsonCall {
+    type Args = JsArgs2;
+
+    fn args(self, env: &Env) -> napi::Result<JsArgs2> {
+        Ok(FnArgs::from((
+            js_value(env, self.value)?,
+            self.scope.into_js(env)?,
+        )))
+    }
+}
+
 fn scoped_json_callback_tsfn(
     env: &Env,
     func: &Function<JsArg, JsArg>,
-) -> napi::Result<Tsfn<ScopedJsonCall, JsArgs2, JsArg>> {
+    error_prefix: &'static str,
+) -> napi::Result<callable::AsyncReplyTsfn<ScopedJsonCall>> {
     let func: Function<JsArg, JsArg> = callback_factory::wrap(env, Wrapper::Execution, func)?;
-    callback_factory::wrap::<JsArgs2, JsArg>(env, Wrapper::Scoped, &func)?
-        .build_threadsafe_function::<ScopedJsonCall>()
-        .weak::<true>()
-        .build_callback(|ctx: ThreadsafeCallContext<ScopedJsonCall>| {
-            let value = js_value(&ctx.env, ctx.value.value)?;
-            Ok(FnArgs::from((value, ctx.value.scope.into_js(&ctx.env)?)))
-        })
+    let scoped: Function<JsArgs2, JsArg> = callback_factory::wrap(env, Wrapper::Scoped, &func)?;
+    callable::reply_tsfn(env, &scoped, error_prefix)
 }
 
 fn serialize_llm_request(request: &LlmRequest) -> FlowResult<Json> {
@@ -854,8 +866,8 @@ fn serialize_llm_request(request: &LlmRequest) -> FlowResult<Json> {
 }
 
 fn scoped_fn<A: Send + 'static, R: Send + 'static>(
-    func: Tsfn<ScopedJsonCall, JsArgs2, JsArg>,
-    name: &'static str,
+    func: callable::AsyncReplyTsfn<ScopedJsonCall>,
+    error_prefix: &'static str,
     encode: fn(A) -> FlowResult<Json>,
     decode: fn(Json) -> FlowResult<R>,
 ) -> Arc<dyn Fn(A) -> BoxFuture<FlowResult<R>> + Send + Sync> {
@@ -868,7 +880,7 @@ fn scoped_fn<A: Send + 'static, R: Send + 'static>(
                 value: encode(value)?,
                 scope,
             };
-            decode(callable::call_tsfn(&func, call, name).await?)
+            decode(callable::call_tsfn(&func, call, error_prefix).await?)
         })
     })
 }
@@ -1007,9 +1019,35 @@ struct NodePluginRegisterCall {
     registrations: PluginRegistrations,
 }
 
+impl callable::JsCall for NodePluginRegisterCall {
+    type Args = JsArgs2;
+
+    fn args(self, env: &Env) -> napi::Result<JsArgs2> {
+        let plugin_config = js_value(env, self.plugin_config)?;
+        let plugin_context = build_plugin_context(env, self.namespace_prefix, self.registrations)?;
+        Ok(FnArgs::from((plugin_config, detach(env, &plugin_context))))
+    }
+}
+
 const CONDITIONAL_GATE_PREFIX: &str = "conditional middleware guardrail";
 
 const CONDITIONAL_GATE_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct ConditionalGateCall {
+    kinds: Vec<String>,
+    registration_name: String,
+}
+
+impl callable::JsCall for ConditionalGateCall {
+    type Args = JsArgs2;
+
+    fn args(self, env: &Env) -> napi::Result<JsArgs2> {
+        Ok(FnArgs::from((
+            js_value(env, self.kinds)?,
+            js_value(env, self.registration_name)?,
+        )))
+    }
+}
 
 fn decode_conditional_gate_result(value: FlowResult<Json>) -> Result<Option<String>> {
     serde_json::from_value(value?).map_err(|_| {
@@ -1023,26 +1061,21 @@ fn node_conditional_middleware_guardrail(
 ) -> napi::Result<ConditionalMiddlewareGuardrailFn> {
     let callback = callable::SyncJsCallback::new(
         env,
-        callback_factory::wrap::<FnArgs<(Vec<String>, String)>, JsArg>(
-            env,
-            Wrapper::ConditionalGate,
-            guardrail,
-        )?,
+        callback_factory::wrap::<JsArgs2, JsArg>(env, Wrapper::ConditionalGate, guardrail)?,
         CONDITIONAL_GATE_PREFIX,
         Some(CONDITIONAL_GATE_CALLBACK_TIMEOUT),
     )?;
     Ok(Arc::new(move |kinds, effective_name| {
-        let kinds = kinds
-            .iter()
-            .map(|kind| kind.as_str().to_string())
-            .collect::<Vec<String>>();
-        decode_conditional_gate_result(callback.call((kinds, effective_name.to_string()).into()))
-            .unwrap_or_else(|error| {
-                record_callback_error(format!(
-                    "Node conditional middleware guardrail failed open: {error}"
-                ));
-                None
-            })
+        let call = ConditionalGateCall {
+            kinds: kinds.iter().map(|kind| kind.as_str().to_string()).collect(),
+            registration_name: effective_name.to_string(),
+        };
+        decode_conditional_gate_result(callback.call(call)).unwrap_or_else(|error| {
+            record_callback_error(format!(
+                "Node conditional middleware guardrail failed open: {error}"
+            ));
+            None
+        })
     }))
 }
 
@@ -1082,10 +1115,12 @@ fn node_llm_response_codec(
 
 const PLUGIN_VALIDATE_PREFIX: &str = "JS plugin validate failed";
 
+const PLUGIN_REGISTER_PREFIX: &str = "JS plugin register callback failed";
+
 struct NodePlugin {
     plugin_kind: String,
     validate: Option<callable::SyncJsCallback<Json>>,
-    register: Tsfn<NodePluginRegisterCall, JsArgs2, JsArg>,
+    register: callable::AsyncReplyTsfn<NodePluginRegisterCall>,
 }
 
 impl Plugin for NodePlugin {
@@ -1137,7 +1172,7 @@ impl Plugin for NodePlugin {
                 registrations: registrations.clone(),
             };
             if let Err(error) =
-                callable::call_tsfn(&self.register, payload, "JS plugin register callback").await
+                callable::call_tsfn(&self.register, payload, PLUGIN_REGISTER_PREFIX).await
             {
                 rollback_registrations(&mut lock(&registrations));
                 return Err(PluginError::RegistrationFailed(error.to_string()));
@@ -1472,8 +1507,7 @@ pub fn test_closed_collector_callback(
     chunk: Json,
 ) -> Result<()> {
     clear_recorded_callback_error();
-    let callback = callable::JsStreamCallback::<callable::JsCollectorCall>::new(&env, &callback)?
-        .without_direct();
+    let callback = callable::JsStreamCallback::<callable::JsCollectorCall>::new(&env, &callback)?;
     callback.abort_tsfn()?;
     let LlmCollector::Async(mut wrapped) = callable::wrap_js_collector_fn(callback) else {
         return Err(Error::generic_failure("JS collectors are asynchronous"));
@@ -1488,8 +1522,7 @@ pub fn test_closed_finalizer_callback(
     #[napi(ts_arg_type = "(...args: any[]) => any")] callback: Callback,
 ) -> Result<Json> {
     clear_recorded_callback_error();
-    let callback = callable::JsStreamCallback::<callable::JsFinalizerCall>::new(&env, &callback)?
-        .without_direct();
+    let callback = callable::JsStreamCallback::<callable::JsFinalizerCall>::new(&env, &callback)?;
     callback.abort_tsfn()?;
     let LlmFinalizer::Async(wrapped) = callable::wrap_js_finalizer_fn(callback, Default::default())
     else {
@@ -1512,7 +1545,7 @@ pub fn test_closed_promise_aware_call<'env>(
     let promise_aware = Arc::new(PromiseAwareFn::new(env, &func)?);
     let force_conversion_failure = force_conversion_failure.unwrap_or(false);
     if !force_conversion_failure {
-        promise_aware.close()?;
+        promise_aware.abort_tsfn()?;
     }
 
     spawn_promise(
@@ -1866,8 +1899,8 @@ pub fn tool_call_execute<'env>(
     tool_call_id: Option<String>,
 ) -> Result<PromiseRaw<'env, ToolExecutionResult>> {
     let func = scoped_fn(
-        scoped_json_callback_tsfn(env, &func)?,
-        "JS tool execution callback",
+        scoped_json_callback_tsfn(env, &func, "JS tool execution callback failed")?,
+        "JS tool execution callback failed",
         Ok,
         callable::parse_tool_execution_result,
     );
@@ -2076,8 +2109,8 @@ pub fn llm_call_execute<'env>(
 ) -> Result<PromiseRaw<'env, Json>> {
     let request: LlmRequest = parse_json(request, "LlmRequest")?;
     let func = scoped_fn(
-        scoped_json_callback_tsfn(env, &func)?,
-        "JS LLM execution callback",
+        scoped_json_callback_tsfn(env, &func, "JS LLM execution callback failed")?,
+        "JS LLM execution callback failed",
         |request| serialize_llm_request(&request),
         Ok,
     );
@@ -3900,26 +3933,12 @@ pub fn register_plugin(
         .transpose()?;
     let register: Function<JsArgs2, JsArg> =
         callback_factory::wrap(&env, Wrapper::Middleware, &register)?;
-    let register_tsfn = register
-        .build_threadsafe_function::<NodePluginRegisterCall>()
-        .weak::<true>()
-        .build_callback(move |ctx: ThreadsafeCallContext<NodePluginRegisterCall>| {
-            let plugin_config = js_value(&ctx.env, ctx.value.plugin_config)?;
-            let plugin_context = build_plugin_context(
-                &ctx.env,
-                ctx.value.namespace_prefix,
-                ctx.value.registrations,
-            )?;
-            Ok(FnArgs::from((
-                plugin_config,
-                detach(&ctx.env, &plugin_context),
-            )))
-        })?;
+    let register = callable::reply_tsfn(&env, &register, PLUGIN_REGISTER_PREFIX)?;
 
     register_plugin_impl(Arc::new(NodePlugin {
         plugin_kind,
         validate,
-        register: register_tsfn,
+        register,
     }))
     .map_err(Error::from)
 }
@@ -3938,9 +3957,33 @@ pub fn deregister_plugin(plugin_kind: String) -> bool {
 #[napi]
 pub struct PluginHostActivation {
     close_state: Arc<DynamicPluginCloseState>,
+    teardown: std::sync::mpsc::Sender<Box<CorePluginHostActivation>>,
 }
 
 type DynamicPluginTeardownResult = std::result::Result<(), Arc<Error>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DynamicPluginTeardownTrigger {
+    Close,
+    Finalizer,
+}
+
+fn run_dynamic_plugin_teardown(
+    state: Arc<DynamicPluginCloseState>,
+    requests: std::sync::mpsc::Receiver<Box<CorePluginHostActivation>>,
+) {
+    loop {
+        match requests.recv() {
+            Ok(activation) => state.close(activation, DynamicPluginTeardownTrigger::Close),
+            Err(std::sync::mpsc::RecvError) => {
+                if let Some(activation) = state.take_active() {
+                    state.close(activation, DynamicPluginTeardownTrigger::Finalizer);
+                }
+                return;
+            }
+        }
+    }
+}
 
 enum DynamicPluginCloseStatus {
     Active(Box<CorePluginHostActivation>),
@@ -3995,61 +4038,35 @@ impl DynamicPluginCloseState {
         Some(activation)
     }
 
-    fn begin_close(self: &Arc<Self>, log_finalizer_error: bool) {
-        let Some(activation) = self.take_active() else {
-            return;
-        };
-        let activation = Arc::new(StdMutex::new(Some(activation)));
-        let worker_activation = Arc::clone(&activation);
-        let close_state = Arc::clone(self);
-        let spawn = std::thread::Builder::new()
-            .name("nemo-relay-node-plugin-teardown".into())
-            .spawn(move || {
-                let activation = lock(&worker_activation).take();
-                let (activation, result) = match activation {
-                    Some(mut activation) => {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            activation.close()
-                        }))
-                        .map_err(|_| Error::generic_failure("plugin host teardown task panicked"))
-                        .and_then(|result| result.map_err(Error::from))
-                        .map_err(Arc::new);
-                        *lock(&close_state.report) = activation.report();
-                        (Some(activation), result)
-                    }
-                    None => (
-                        None,
-                        Err(Arc::new(Error::generic_failure(
-                            "plugin host teardown task lost its activation",
-                        ))),
-                    ),
-                };
-                if log_finalizer_error && let Err(error) = &result {
-                    eprintln!("nemo_relay: plugin host finalizer teardown failed: {error}");
-                }
-                close_state.finish(activation, result);
-            });
-
-        if let Err(error) = spawn {
-            let activation = lock(&activation).take();
-            let error = Arc::new(Error::generic_failure(format!(
-                "failed to start dynamic plugin teardown task: {error}"
-            )));
-            if log_finalizer_error {
-                if let Some(activation) = activation {
-                    std::mem::forget(activation);
-                }
-                eprintln!("nemo_relay: dynamic plugin finalizer teardown failed: {error}");
-                self.finish(None, Err(error));
-            } else {
-                self.finish(activation, Err(error));
-            }
+    fn request_close(&self, teardown: &std::sync::mpsc::Sender<Box<CorePluginHostActivation>>) {
+        if let Some(activation) = self.take_active() {
+            teardown.send(activation).expect(
+                "the dynamic plugin teardown thread outlives every handle that can close it",
+            );
         }
+    }
+
+    fn close(
+        &self,
+        mut activation: Box<CorePluginHostActivation>,
+        trigger: DynamicPluginTeardownTrigger,
+    ) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| activation.close()))
+            .map_err(|_| Error::generic_failure("plugin host teardown task panicked"))
+            .and_then(|result| result.map_err(Error::from))
+            .map_err(Arc::new);
+        *lock(&self.report) = activation.report();
+        if trigger == DynamicPluginTeardownTrigger::Finalizer
+            && let Err(error) = &result
+        {
+            eprintln!("nemo_relay: plugin host finalizer teardown failed: {error}");
+        }
+        self.finish(activation, result);
     }
 
     fn finish(
         &self,
-        activation: Option<Box<CorePluginHostActivation>>,
+        activation: Box<CorePluginHostActivation>,
         result: DynamicPluginTeardownResult,
     ) {
         self.finish_with_hook(activation, result, || {});
@@ -4057,16 +4074,15 @@ impl DynamicPluginCloseState {
 
     fn finish_with_hook(
         &self,
-        activation: Option<Box<CorePluginHostActivation>>,
+        activation: Box<CorePluginHostActivation>,
         result: DynamicPluginTeardownResult,
         before_publish: impl FnOnce(),
     ) {
         let mut status = lock(&self.status);
-        *status = match activation {
-            Some(activation) if result.is_err() && activation.is_active() => {
-                DynamicPluginCloseStatus::Active(activation)
-            }
-            _ => DynamicPluginCloseStatus::Closed,
+        *status = if result.is_err() && activation.is_active() {
+            DynamicPluginCloseStatus::Active(activation)
+        } else {
+            DynamicPluginCloseStatus::Closed
         };
         before_publish();
         self.completion.send_replace(Some(result));
@@ -4113,8 +4129,8 @@ impl PluginHostActivation {
     /// close the same activation.
     #[napi(ts_return_type = "Promise<void>", catch_unwind)]
     pub fn close<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+        self.close_state.request_close(&self.teardown);
         let close_state = Arc::clone(&self.close_state);
-        close_state.begin_close(false);
         spawn_promise(
             env,
             async move {
@@ -4138,12 +4154,6 @@ impl PluginHostActivation {
     }
 }
 
-impl Drop for PluginHostActivation {
-    fn drop(&mut self) {
-        self.close_state.begin_close(true);
-    }
-}
-
 /// Initialize the core-owned static and dynamic plugin host from layered files.
 #[napi(catch_unwind)]
 pub fn initialize<'env>(
@@ -4159,8 +4169,20 @@ pub fn initialize<'env>(
             let activation = initialize_impl(config, additional_plugins_toml.map(Into::into))
                 .await
                 .map_err(Error::from)?;
+            let close_state = Arc::new(DynamicPluginCloseState::new(activation));
+            let (teardown, requests) = std::sync::mpsc::channel();
+            let worker_state = Arc::clone(&close_state);
+            std::thread::Builder::new()
+                .name("nemo-relay-node-plugin-teardown".into())
+                .spawn(move || run_dynamic_plugin_teardown(worker_state, requests))
+                .map_err(|error| {
+                    Error::generic_failure(format!(
+                        "failed to start the dynamic plugin teardown thread: {error}"
+                    ))
+                })?;
             Ok::<_, Error>(PluginHostActivation {
-                close_state: Arc::new(DynamicPluginCloseState::new(activation)),
+                close_state,
+                teardown,
             })
         },
         js_value,
