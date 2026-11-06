@@ -1,0 +1,35 @@
+# Local verification only: the upstream ci.yaml gates every job on
+# `github.repository == 'NVIDIA/NeMo-Relay'`, so it skips in a fork. This workflow
+# exists to run the fmt / clippy / test gates the upstream PR will run, inside the
+# fork; it is not part of any upstream change.
+name: local-rust-check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'pull-request/**'
+
+jobs:
+  codecs:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      # rust-toolchain.toml pins the version but not the components.
+      - name: Components
+        run: rustup component add rustfmt clippy
+      - name: cargo fmt --all --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -p nemo-relay-codecs --all-targets -- -D warnings
+        run: cargo clippy -p nemo-relay-codecs --all-targets -- -D warnings 2>&1 | tail -40
+      - name: cargo test -p nemo-relay-codecs --lib
+        run: cargo test -p nemo-relay-codecs --lib 2>&1 | tail -60
