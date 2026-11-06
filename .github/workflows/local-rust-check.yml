@@ -1,0 +1,28 @@
+# Local verification only: the upstream ci.yaml gates every job on
+# `github.repository == 'NVIDIA/NeMo-Relay'`, so it skips in a fork. This workflow
+# exists to compile and run the codecs tests in the fork; it is not part of any
+# upstream change.
+name: local-rust-check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'pull-request/**'
+
+jobs:
+  codecs:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      - name: cargo test -p nemo-relay-codecs --lib
+        run: cargo test -p nemo-relay-codecs --lib 2>&1 | tail -60
